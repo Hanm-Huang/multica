@@ -28,14 +28,15 @@ import (
 // local fake Bot API, a controllable clock and a shared fake database — two
 // Outbound values sharing one of those stand in for two backend replicas.
 type auditBot struct {
-	mu                    sync.Mutex
-	messages              map[int64]string
-	methods               []string
-	loseFirstSendResponse bool
-	failFirstEdit         bool
-	forbidEdits           bool
-	sends                 int64
-	edits                 int
+	mu                     sync.Mutex
+	messages               map[int64]string
+	methods                []string
+	loseFirstSendResponse  bool
+	serverErrorAfterAccept bool
+	failFirstEdit          bool
+	forbidEdits            bool
+	sends                  int64
+	edits                  int
 }
 
 func (a *auditBot) serve(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +51,13 @@ func (a *auditBot) serve(w http.ResponseWriter, r *http.Request) {
 	case "sendMessage":
 		a.sends++
 		a.messages[a.sends] = body["text"].(string)
+		if a.serverErrorAfterAccept && a.sends == 1 {
+			// Accepted, then failed on the way back. The message is in the
+			// chat; the caller has no way to know that.
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"ok":false,"error_code":500,"description":"Internal Server Error"}`))
+			return
+		}
 		if a.loseFirstSendResponse && a.sends == 1 {
 			// The provider accepted the message, but the caller gets no ID.
 			conn, _, err := w.(http.Hijacker).Hijack()
@@ -218,12 +226,18 @@ func TestAuditAmbiguousFinalEdit(t *testing.T) {
 
 func TestAuditAmbiguousFailureNoticeEdit(t *testing.T) {
 	bot := &auditBot{failFirstEdit: true}
-	o, _, _, _ := auditSetup(t, bot)
+	o, _, c, _ := auditSetup(t, bot)
 	e := telegramTestEvent()
 	o.handleTaskMessage(auditPartial(e))
-	o.handleTaskFailed(events.Event{TaskID: e.TaskID, Type: protocol.EventTaskFailed,
-		Payload: map[string]any{"retry_pending": false}})
+	o.handleTaskFailed(events.Event{TaskID: e.TaskID, ChatSessionID: e.ChatSessionID,
+		Type: protocol.EventTaskFailed, Payload: map[string]any{"retry_pending": false}})
+	auditDrain(t, o, c, e.ChatSessionID)
 	bot.wantOne(t)
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	if bot.messages[1] != taskFailedText {
+		t.Fatalf("placeholder was not turned into the failure notice: %q; methods=%v", bot.messages[1], bot.methods)
+	}
 }
 
 func TestAuditDuplicateTerminalEvent(t *testing.T) {

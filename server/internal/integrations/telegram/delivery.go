@@ -27,6 +27,7 @@ package telegram
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -134,34 +135,43 @@ func (l *deliveryLease) sendState() string {
 	return l.row.SendState
 }
 
-// turnIDFor maps a task to the user turn it belongs to: the root of its
-// automatic-retry chain. A retry runs under a new task id and has to finish
-// the reply its previous attempt started rather than answer beside it.
+// replyTurn is which user turn a task belongs to and how far down that turn's
+// retry chain the task sits.
+type replyTurn struct {
+	id    pgtype.UUID
+	depth int32
+}
+
+// turnFor maps a task to its user turn: the root of its automatic-retry chain.
+// A retry runs under a new task id and has to finish the reply its previous
+// attempt started rather than answer beside it.
 //
-// Falling back to the task's own id is right for anything this lineage does
-// not cover — a task with no queue row is its own turn — and keeps delivery
-// working rather than failing closed on a lookup.
-func (o *Outbound) turnIDFor(ctx context.Context, taskID pgtype.UUID) pgtype.UUID {
-	turnID, err := o.q.GetChannelReplyTurnID(ctx, taskID)
+// A task with no queue row is its own turn, at depth zero — that is a fact, not
+// a failure. Any other error is reported: guessing that the task is its own
+// turn would open a second reply next to the one the previous attempt is still
+// holding, which is the bug this lineage exists to prevent.
+func (o *Outbound) turnFor(ctx context.Context, taskID pgtype.UUID) (replyTurn, error) {
+	row, err := o.q.GetChannelReplyTurn(ctx, taskID)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			o.logger.WarnContext(ctx, "telegram outbound: retry lineage lookup failed; treating the task as its own turn",
-				"task_id", uuidText(taskID), "error", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return replyTurn{id: taskID}, nil
 		}
-		return taskID
+		return replyTurn{}, fmt.Errorf("resolve reply turn: %w", err)
 	}
-	if !turnID.Valid {
-		return taskID
+	if !row.TurnID.Valid {
+		return replyTurn{id: taskID}, nil
 	}
-	return turnID
+	return replyTurn{id: row.TurnID, depth: int32(row.AttemptDepth)}, nil
 }
 
 // acquireDelivery takes the turn's lease for one of the delivery phases.
-func (o *Outbound) acquireDelivery(ctx context.Context, target *replyTarget, turnID pgtype.UUID, phase string) (*deliveryLease, deliveryStatus, error) {
+func (o *Outbound) acquireDelivery(ctx context.Context, target *replyTarget, turn replyTurn, phase string) (*deliveryLease, deliveryStatus, error) {
+	turnID := turn.id
 	token := pgtype.UUID{Bytes: uuid.New(), Valid: true}
 	row, err := o.q.AcquireChannelReplyDelivery(ctx, db.AcquireChannelReplyDeliveryParams{
 		TurnID:         turnID,
 		TaskID:         target.taskID,
+		AttemptDepth:   turn.depth,
 		BindingID:      target.bindingID,
 		InstallationID: target.installationID,
 		ChannelType:    string(TypeTelegram),
@@ -191,6 +201,12 @@ func (o *Outbound) acquireDelivery(ctx context.Context, target *replyTarget, tur
 		return nil, deliveryClosed, nil
 	}
 	if phase == deliveryPhaseStreaming && current.Phase == deliveryPhaseTerminal {
+		return nil, deliveryClosed, nil
+	}
+	if turn.depth < current.AttemptDepth {
+		// A later attempt of this turn has taken over. This one is not waiting
+		// for anything — it has been superseded, and its frames must not
+		// rewrite what the user is now reading.
 		return nil, deliveryClosed, nil
 	}
 	return nil, deliveryBusy, nil
@@ -238,12 +254,19 @@ func classifySend(err error) deliveryOutcome {
 	}
 }
 
-// isDefiniteRejection reports whether Telegram answered and refused. Anything
-// else — transport failure, timeout, an unreadable response — leaves the
-// outcome genuinely unknown.
+// isDefiniteRejection reports whether Telegram answered in a way that proves
+// the message was not posted.
+//
+// A 5xx does not prove that. Telegram can accept a sendMessage and still fail
+// on the way back, and treating that as "nothing was sent" is what puts the
+// answer in the chat twice. Only a client error — including a 429, which is
+// refused outright — is evidence of a message that never landed.
 func isDefiniteRejection(err error) bool {
 	var ae *apiError
-	return errors.As(err, &ae)
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return ae.Code >= 400 && ae.Code < 500
 }
 
 // recordSend writes what Telegram did. placeholder distinguishes the streamed
@@ -313,10 +336,12 @@ func (o *Outbound) settleDelivery(ctx context.Context, lease *deliveryLease, rea
 // empty. It creates the row when the turn never reached Telegram at all:
 // without that, a first text frame arriving after the cancellation would find
 // nothing, open a placeholder, and leave it there with nothing to finish it.
-func (o *Outbound) closeTurn(ctx context.Context, target *replyTarget, turnID pgtype.UUID, reason string) (bool, error) {
+func (o *Outbound) closeTurn(ctx context.Context, target *replyTarget, turn replyTurn, reason string) (bool, error) {
+	turnID := turn.id
 	_, err := o.q.CloseChannelReplyDeliveryTurn(ctx, db.CloseChannelReplyDeliveryTurnParams{
 		TurnID:         turnID,
 		TaskID:         target.taskID,
+		AttemptDepth:   turn.depth,
 		BindingID:      target.bindingID,
 		InstallationID: target.installationID,
 		ChannelType:    string(TypeTelegram),

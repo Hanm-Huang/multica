@@ -1289,8 +1289,8 @@ func TestOutboundEmptyTerminalReplyClearsStreamAndQueuesTheClose(t *testing.T) {
 		t.Fatalf("empty reply did not queue its close: %+v", queued)
 	}
 	reply := queued.queue[0]
-	if !reply.settleOnly || reply.settleReason != "empty_reply" {
-		t.Fatalf("queued reply is not a close: settleOnly=%v reason=%q", reply.settleOnly, reply.settleReason)
+	if reply.kind != terminalKindClose || reply.settleReason != "empty_reply" {
+		t.Fatalf("queued reply is not a close: kind=%v reason=%q", reply.kind, reply.settleReason)
 	}
 	if reply.byteSize != 0 {
 		t.Fatalf("empty reply charged %d bytes to the queue budget", reply.byteSize)
@@ -1403,7 +1403,38 @@ func TestOutboundTerminalFailureSendsNotice(t *testing.T) {
 	e.Type = protocol.EventTaskFailed
 	e.Payload = map[string]any{"retry_pending": false}
 	o.handleTaskFailed(e)
+	// The notice is terminal work now: it waits for the turn's lease like the
+	// answer does, so it is delivered by the queue rather than inline.
+	drainTerminalQueueForTest(t, o, e.ChatSessionID)
 	if requests != 1 {
 		t.Fatalf("terminal failure requests = %d, want 1", requests)
+	}
+}
+
+// drainTerminalQueueForTest runs one session's queued terminal work to
+// completion, the way the workers would.
+func drainTerminalQueueForTest(t *testing.T, o *Outbound, sessionID string) {
+	t.Helper()
+	ctx := context.Background()
+	for {
+		o.terminalMu.Lock()
+		session := o.terminalSessions[sessionID]
+		if session == nil || len(session.queue) == 0 {
+			o.terminalMu.Unlock()
+			return
+		}
+		reply := session.queue[0]
+		session.queue = session.queue[1:]
+		o.terminalMu.Unlock()
+		for i := 0; i < 25; i++ {
+			result := o.sendNextTerminalRequest(ctx, reply)
+			if result.done {
+				o.cleanupTerminalReply(reply)
+				break
+			}
+			if d := result.retryAt.Sub(o.now()); d > 0 {
+				_ = o.wait(ctx, d)
+			}
+		}
 	}
 }

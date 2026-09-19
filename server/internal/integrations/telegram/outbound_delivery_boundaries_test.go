@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -142,7 +143,11 @@ func TestReview8545PostgresAbandonedInFlightDoesNotBlockForever(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, status, err := o.acquireDelivery(ctx, target, o.turnIDFor(ctx, target.taskID), deliveryPhaseStreaming)
+	turn, err := o.turnFor(ctx, target.taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, status, err := o.acquireDelivery(ctx, target, turn, deliveryPhaseStreaming)
 	if err != nil || status != deliveryAcquired {
 		t.Fatalf("delivery not acquired: status=%v err=%v", status, err)
 	}
@@ -228,10 +233,12 @@ func TestReview8545PostgresRetryWithoutStreamKeepsExistingReply(t *testing.T) {
 
 func TestReview8545PostgresFailureNoticeRespectsUnknownSend(t *testing.T) {
 	bot := &auditBot{loseFirstSendResponse: true}
-	a, _, _, e := review8545Setup(t, bot)
+	a, _, c, e := review8545Setup(t, bot)
 	a.handleTaskMessage(telegramPartialEvent(e.TaskID, "accepted before response loss"))
 	b := review8545Second(a)
-	b.handleTaskFailed(events.Event{TaskID: e.TaskID, Payload: map[string]any{"retry_pending": false}})
+	b.handleTaskFailed(events.Event{TaskID: e.TaskID, ChatSessionID: e.ChatSessionID,
+		Payload: map[string]any{"retry_pending": false}})
+	auditDrain(t, b, c, e.ChatSessionID)
 	review8545MessageCount(t, bot, 1)
 }
 
@@ -319,5 +326,151 @@ func TestReview8545PostgresStaleStreamCannotOverwriteSettledAnswer(t *testing.T)
 	defer bot.mu.Unlock()
 	if bot.messages[1] != chatDoneContent(e.Payload) {
 		t.Fatalf("settled final answer was overwritten: %q; methods=%v", bot.messages[1], bot.methods)
+	}
+}
+
+// A 5xx is not proof that nothing was posted. Telegram can accept a
+// sendMessage and still fail on the way back, so treating it as a definite
+// rejection puts the same answer in the chat twice.
+func TestReview8545PostgresServerErrorAfterAcceptIsNotResent(t *testing.T) {
+	bot := &auditBot{serverErrorAfterAccept: true}
+	o, _, c, e := review8545Setup(t, bot)
+	o.handleTaskMessage(telegramPartialEvent(e.TaskID, "accepted then 500"))
+	o.enqueueTerminalReply(e)
+	auditDrain(t, o, c, e.ChatSessionID)
+	review8545MessageCount(t, bot, 1)
+}
+
+type review8545FailTurnLookup struct {
+	*review8545Queries
+	fail atomic.Bool
+}
+
+func (q *review8545FailTurnLookup) GetChannelReplyTurn(ctx context.Context, id pgtype.UUID) (db.GetChannelReplyTurnRow, error) {
+	if q.fail.Load() {
+		return db.GetChannelReplyTurnRow{}, errors.New("injected lineage lookup failure")
+	}
+	return q.review8545Queries.GetChannelReplyTurn(ctx, id)
+}
+
+// A lineage lookup that fails must not fall back to "this task is its own
+// turn": that opens a second reply beside the one the previous attempt holds.
+func TestReview8545PostgresTurnLookupFailureDoesNotOpenSecondReply(t *testing.T) {
+	bot := &auditBot{}
+	o, base, c, e := review8545Setup(t, bot)
+	retryTask := util.UUIDToString(review8545ID())
+	seedRetryChain(t, e.TaskID, retryTask)
+	o.handleTaskMessage(telegramPartialEvent(e.TaskID, "first attempt"))
+
+	q := &review8545FailTurnLookup{review8545Queries: base}
+	q.fail.Store(true)
+	o.q = q
+	o.handleTaskMessage(telegramPartialEvent(retryTask, "retry attempt"))
+	review8545MessageCount(t, bot, 1)
+
+	// Once the lookup recovers the retry finishes the reply it inherited.
+	q.fail.Store(false)
+	retry := e
+	retry.TaskID = retryTask
+	retry.Payload = protocol.ChatDonePayload{TaskID: retryTask, ChatSessionID: e.ChatSessionID, Content: "retry complete answer"}
+	o.enqueueTerminalReply(retry)
+	auditDrain(t, o, c, retry.ChatSessionID)
+	review8545MessageCount(t, bot, 1)
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	if bot.messages[1] != "retry complete answer" {
+		t.Fatalf("inherited reply not finished by the retry: %q; methods=%v", bot.messages[1], bot.methods)
+	}
+}
+
+// Once a retry has taken the turn, a late frame from the attempt it superseded
+// must not take it back and rewrite what the user is reading.
+func TestReview8545PostgresSupersededAttemptCannotRewriteReply(t *testing.T) {
+	bot := &auditBot{}
+	o, _, c, e := review8545Setup(t, bot)
+	retryTask := util.UUIDToString(review8545ID())
+	seedRetryChain(t, e.TaskID, retryTask)
+
+	o.handleTaskMessage(telegramPartialEvent(e.TaskID, "first attempt"))
+	c.advance(editInterval + time.Millisecond)
+	o.handleTaskMessage(telegramPartialEvent(retryTask, "retry attempt"))
+	c.advance(editInterval + time.Millisecond)
+	o.handleTaskMessage(telegramPartialEvent(e.TaskID, " stale tail from the old attempt"))
+
+	review8545MessageCount(t, bot, 1)
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	if strings.Contains(bot.messages[1], "stale tail") {
+		t.Fatalf("superseded attempt rewrote the reply: %q; methods=%v", bot.messages[1], bot.methods)
+	}
+}
+
+// A reply settled by another replica leaves this one holding a stream and a
+// chat-scheduler reference. Nothing else can release them, so the next frame
+// for that turn must.
+func TestReview8545PostgresSettledElsewhereReleasesLocalState(t *testing.T) {
+	bot := &auditBot{}
+	a, _, c, e := review8545Setup(t, bot)
+	a.handleTaskMessage(telegramPartialEvent(e.TaskID, "streamed on this replica"))
+	b := review8545Second(a)
+	b.enqueueTerminalReply(e)
+	auditDrain(t, b, c, e.ChatSessionID)
+
+	a.mu.Lock()
+	held := len(a.streams)
+	a.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("setup expected one local stream, found %d", held)
+	}
+	c.advance(editInterval + time.Millisecond)
+	a.handleTaskMessage(telegramPartialEvent(e.TaskID, " late tail"))
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.streams) != 0 {
+		t.Fatal("local stream survived a reply another replica settled")
+	}
+	for key, schedule := range a.chats {
+		if schedule.refs != 0 {
+			t.Fatalf("chat schedule %v still referenced after the reply settled", key)
+		}
+	}
+}
+
+// A failure notice must wait for the turn like any other terminal work. Losing
+// it because a text frame held the turn at that instant leaves the placeholder
+// as the last thing the user ever sees.
+func TestReview8545PostgresFailureNoticeWaitsForALiveLease(t *testing.T) {
+	bot := &auditBot{}
+	a, _, c, e := review8545Setup(t, bot)
+	a.leaseTTL = 100 * time.Millisecond
+	a.handleTaskMessage(telegramPartialEvent(e.TaskID, "streamed reply"))
+
+	ctx := context.Background()
+	target, err := a.resolveTarget(ctx, e, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := a.turnFor(ctx, target.taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hold the turn the way a frame mid-request would.
+	if _, status, err := a.acquireDelivery(ctx, target, turn, deliveryPhaseStreaming); err != nil || status != deliveryAcquired {
+		t.Fatalf("could not hold the turn: status=%v err=%v", status, err)
+	}
+
+	b := review8545Second(a)
+	b.leaseTTL = 100 * time.Millisecond
+	b.handleTaskFailed(events.Event{TaskID: e.TaskID, ChatSessionID: e.ChatSessionID,
+		Payload: map[string]any{"retry_pending": false}})
+	time.Sleep(150 * time.Millisecond)
+	auditDrain(t, b, c, e.ChatSessionID)
+
+	review8545MessageCount(t, bot, 1)
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	if bot.messages[1] != taskFailedText {
+		t.Fatalf("failure notice was lost: reply still reads %q; methods=%v", bot.messages[1], bot.methods)
 	}
 }
