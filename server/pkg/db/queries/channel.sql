@@ -376,6 +376,9 @@ cleared_dingtalk_bot_identity AS (
 cleared_dingtalk_group_routes AS (
     DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM doomed)
 ),
+cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery WHERE installation_id IN (SELECT id FROM doomed)
+),
 cleared_task_deliveries AS (
     DELETE FROM channel_task_delivery WHERE installation_id IN (SELECT id FROM doomed)
 ),
@@ -885,6 +888,8 @@ WITH target AS (
     DELETE FROM channel_task_delivery AS delivery WHERE delivery.binding_id IN (SELECT id FROM target)
 ), cleared_outbound AS (
     DELETE FROM channel_outbound_message AS outbound WHERE outbound.binding_id IN (SELECT id FROM target)
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply WHERE reply.binding_id IN (SELECT id FROM target)
 ), deleted_binding AS (
     DELETE FROM channel_chat_session_binding AS binding WHERE binding.id IN (SELECT id FROM target)
 )
@@ -909,6 +914,10 @@ WITH cleared_deliveries AS (
     DELETE FROM channel_outbound_message AS outbound
     WHERE outbound.installation_id = sqlc.arg('installation_id')
       AND outbound.channel_type = sqlc.arg('channel_type')
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply
+    WHERE reply.installation_id = sqlc.arg('installation_id')
+      AND reply.channel_type = sqlc.arg('channel_type')
 )
 DELETE FROM channel_chat_session_binding AS binding
 WHERE binding.installation_id = sqlc.arg('installation_id')
@@ -1364,21 +1373,24 @@ SELECT EXISTS (
 -- proves it still holds the lease when it records what happened.
 -- ---------------------------------------------------------------------------
 
--- name: GetChannelReplyTurnID :one
+-- name: GetChannelReplyTurn :one
 -- The root of a task's automatic-retry chain — the user turn all its attempts
--- belong to. A retry runs under a new task id and must finish the reply its
--- previous attempt started, so ownership is keyed by this rather than by any
--- guess about which pending reply looked closest.
-WITH RECURSIVE chain(task_id, parent_task_id) AS (
-    SELECT attempt.id, attempt.retry_of_task_id
+-- belong to — and how far down the chain this attempt sits. A retry runs under
+-- a new task id and must finish the reply its previous attempt started, so
+-- ownership is keyed by the root; depth is what stops an earlier attempt's late
+-- frame from taking the turn back off the retry that superseded it.
+WITH RECURSIVE chain(task_id, parent_task_id, depth) AS (
+    SELECT attempt.id, attempt.retry_of_task_id, 0
     FROM agent_task_queue attempt
     WHERE attempt.id = $1
     UNION ALL
-    SELECT parent.id, parent.retry_of_task_id
+    SELECT parent.id, parent.retry_of_task_id, chain.depth + 1
     FROM agent_task_queue parent
     JOIN chain ON parent.id = chain.parent_task_id
 )
-SELECT chain.task_id FROM chain WHERE chain.parent_task_id IS NULL LIMIT 1;
+SELECT
+    (SELECT root.task_id FROM chain root WHERE root.parent_task_id IS NULL LIMIT 1) AS turn_id,
+    (SELECT COALESCE(MAX(step.depth), 0) FROM chain step)::int AS attempt_depth;
 
 -- name: AcquireChannelReplyDelivery :one
 -- Take the turn's delivery lease, creating the row on first use. Returns no
@@ -1390,14 +1402,15 @@ SELECT chain.task_id FROM chain WHERE chain.parent_task_id IS NULL LIMIT 1;
 -- turn, but never a clean slate: send_state survives, so an outstanding send
 -- stays outstanding rather than being silently retried.
 INSERT INTO channel_reply_delivery (
-    turn_id, task_id, binding_id, installation_id, channel_type, chat_id,
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
     phase, send_state, owner_token, owner_expires_at
 ) VALUES (
-    @turn_id, @task_id, @binding_id, @installation_id, @channel_type, @chat_id,
+    @turn_id, @task_id, @attempt_depth, @binding_id, @installation_id, @channel_type, @chat_id,
     @phase, 'none', @owner_token, now() + make_interval(secs => @lease_seconds::double precision)
 )
 ON CONFLICT (turn_id) DO UPDATE
 SET task_id = EXCLUDED.task_id,
+    attempt_depth = EXCLUDED.attempt_depth,
     phase = CASE WHEN EXCLUDED.phase = 'terminal' THEN 'terminal' ELSE channel_reply_delivery.phase END,
     owner_token = EXCLUDED.owner_token,
     owner_expires_at = EXCLUDED.owner_expires_at,
@@ -1405,6 +1418,10 @@ SET task_id = EXCLUDED.task_id,
 WHERE channel_reply_delivery.phase <> 'settled'
   AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
   AND NOT (EXCLUDED.phase = 'streaming' AND channel_reply_delivery.phase = 'terminal')
+  -- An attempt the retry chain has already moved past may not take the turn
+  -- back: its late frames would rewrite what the user is reading with content
+  -- from a run that was superseded.
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
 RETURNING *;
 
 -- name: GetChannelReplyDelivery :one
@@ -1481,10 +1498,10 @@ WHERE turn_id = $1 AND owner_token = $2 AND phase <> 'settled';
 -- the insert, a first text frame arriving after the cancellation would find
 -- nothing, open a placeholder, and leave it there forever.
 INSERT INTO channel_reply_delivery (
-    turn_id, task_id, binding_id, installation_id, channel_type, chat_id,
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
     phase, send_state, settled_reason
 ) VALUES (
-    @turn_id, @task_id, @binding_id, @installation_id, @channel_type, @chat_id,
+    @turn_id, @task_id, @attempt_depth, @binding_id, @installation_id, @channel_type, @chat_id,
     'settled', 'none', @settled_reason
 )
 ON CONFLICT (turn_id) DO UPDATE

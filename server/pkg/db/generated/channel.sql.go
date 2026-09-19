@@ -13,14 +13,15 @@ import (
 
 const acquireChannelReplyDelivery = `-- name: AcquireChannelReplyDelivery :one
 INSERT INTO channel_reply_delivery (
-    turn_id, task_id, binding_id, installation_id, channel_type, chat_id,
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
     phase, send_state, owner_token, owner_expires_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6,
-    $7, 'none', $8, now() + make_interval(secs => $9::double precision)
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, 'none', $9, now() + make_interval(secs => $10::double precision)
 )
 ON CONFLICT (turn_id) DO UPDATE
 SET task_id = EXCLUDED.task_id,
+    attempt_depth = EXCLUDED.attempt_depth,
     phase = CASE WHEN EXCLUDED.phase = 'terminal' THEN 'terminal' ELSE channel_reply_delivery.phase END,
     owner_token = EXCLUDED.owner_token,
     owner_expires_at = EXCLUDED.owner_expires_at,
@@ -28,12 +29,17 @@ SET task_id = EXCLUDED.task_id,
 WHERE channel_reply_delivery.phase <> 'settled'
   AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
   AND NOT (EXCLUDED.phase = 'streaming' AND channel_reply_delivery.phase = 'terminal')
-RETURNING turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at
+  -- An attempt the retry chain has already moved past may not take the turn
+  -- back: its late frames would rewrite what the user is reading with content
+  -- from a run that was superseded.
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
+RETURNING turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at
 `
 
 type AcquireChannelReplyDeliveryParams struct {
 	TurnID         pgtype.UUID `json:"turn_id"`
 	TaskID         pgtype.UUID `json:"task_id"`
+	AttemptDepth   int32       `json:"attempt_depth"`
 	BindingID      pgtype.UUID `json:"binding_id"`
 	InstallationID pgtype.UUID `json:"installation_id"`
 	ChannelType    string      `json:"channel_type"`
@@ -55,6 +61,7 @@ func (q *Queries) AcquireChannelReplyDelivery(ctx context.Context, arg AcquireCh
 	row := q.db.QueryRow(ctx, acquireChannelReplyDelivery,
 		arg.TurnID,
 		arg.TaskID,
+		arg.AttemptDepth,
 		arg.BindingID,
 		arg.InstallationID,
 		arg.ChannelType,
@@ -67,6 +74,7 @@ func (q *Queries) AcquireChannelReplyDelivery(ctx context.Context, arg AcquireCh
 	err := row.Scan(
 		&i.TurnID,
 		&i.TaskID,
+		&i.AttemptDepth,
 		&i.BindingID,
 		&i.InstallationID,
 		&i.ChannelType,
@@ -535,26 +543,27 @@ func (q *Queries) ClearChannelInstallationBotScopedRows(ctx context.Context, ins
 
 const closeChannelReplyDeliveryTurn = `-- name: CloseChannelReplyDeliveryTurn :one
 INSERT INTO channel_reply_delivery (
-    turn_id, task_id, binding_id, installation_id, channel_type, chat_id,
+    turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id,
     phase, send_state, settled_reason
 ) VALUES (
-    $1, $2, $3, $4, $5, $6,
-    'settled', 'none', $7
+    $1, $2, $3, $4, $5, $6, $7,
+    'settled', 'none', $8
 )
 ON CONFLICT (turn_id) DO UPDATE
 SET phase = 'settled',
-    settled_reason = $7,
+    settled_reason = $8,
     owner_token = NULL,
     owner_expires_at = NULL,
     updated_at = now()
 WHERE channel_reply_delivery.phase <> 'settled'
   AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
-RETURNING turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at
+RETURNING turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at
 `
 
 type CloseChannelReplyDeliveryTurnParams struct {
 	TurnID         pgtype.UUID `json:"turn_id"`
 	TaskID         pgtype.UUID `json:"task_id"`
+	AttemptDepth   int32       `json:"attempt_depth"`
 	BindingID      pgtype.UUID `json:"binding_id"`
 	InstallationID pgtype.UUID `json:"installation_id"`
 	ChannelType    string      `json:"channel_type"`
@@ -570,6 +579,7 @@ func (q *Queries) CloseChannelReplyDeliveryTurn(ctx context.Context, arg CloseCh
 	row := q.db.QueryRow(ctx, closeChannelReplyDeliveryTurn,
 		arg.TurnID,
 		arg.TaskID,
+		arg.AttemptDepth,
 		arg.BindingID,
 		arg.InstallationID,
 		arg.ChannelType,
@@ -580,6 +590,7 @@ func (q *Queries) CloseChannelReplyDeliveryTurn(ctx context.Context, arg CloseCh
 	err := row.Scan(
 		&i.TurnID,
 		&i.TaskID,
+		&i.AttemptDepth,
 		&i.BindingID,
 		&i.InstallationID,
 		&i.ChannelType,
@@ -1112,6 +1123,8 @@ WITH target AS (
     DELETE FROM channel_task_delivery AS delivery WHERE delivery.binding_id IN (SELECT id FROM target)
 ), cleared_outbound AS (
     DELETE FROM channel_outbound_message AS outbound WHERE outbound.binding_id IN (SELECT id FROM target)
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply WHERE reply.binding_id IN (SELECT id FROM target)
 ), deleted_binding AS (
     DELETE FROM channel_chat_session_binding AS binding WHERE binding.id IN (SELECT id FROM target)
 )
@@ -1136,6 +1149,10 @@ WITH cleared_deliveries AS (
     DELETE FROM channel_outbound_message AS outbound
     WHERE outbound.installation_id = $1
       AND outbound.channel_type = $2
+), cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery AS reply
+    WHERE reply.installation_id = $1
+      AND reply.channel_type = $2
 )
 DELETE FROM channel_chat_session_binding AS binding
 WHERE binding.installation_id = $1
@@ -1182,6 +1199,9 @@ cleared_dingtalk_bot_identity AS (
 ),
 cleared_dingtalk_group_routes AS (
     DELETE FROM dingtalk_group_route WHERE installation_id IN (SELECT id FROM doomed)
+),
+cleared_reply_deliveries AS (
+    DELETE FROM channel_reply_delivery WHERE installation_id IN (SELECT id FROM doomed)
 ),
 cleared_task_deliveries AS (
     DELETE FROM channel_task_delivery WHERE installation_id IN (SELECT id FROM doomed)
@@ -1839,7 +1859,7 @@ func (q *Queries) GetChannelOutboundCardByTask(ctx context.Context, arg GetChann
 }
 
 const getChannelReplyDelivery = `-- name: GetChannelReplyDelivery :one
-SELECT turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at FROM channel_reply_delivery WHERE turn_id = $1
+SELECT turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at FROM channel_reply_delivery WHERE turn_id = $1
 `
 
 // Read without taking the lease, so a caller that lost the race can tell
@@ -1850,6 +1870,7 @@ func (q *Queries) GetChannelReplyDelivery(ctx context.Context, turnID pgtype.UUI
 	err := row.Scan(
 		&i.TurnID,
 		&i.TaskID,
+		&i.AttemptDepth,
 		&i.BindingID,
 		&i.InstallationID,
 		&i.ChannelType,
@@ -1867,19 +1888,26 @@ func (q *Queries) GetChannelReplyDelivery(ctx context.Context, turnID pgtype.UUI
 	return i, err
 }
 
-const getChannelReplyTurnID = `-- name: GetChannelReplyTurnID :one
+const getChannelReplyTurn = `-- name: GetChannelReplyTurn :one
 
-WITH RECURSIVE chain(task_id, parent_task_id) AS (
-    SELECT attempt.id, attempt.retry_of_task_id
+WITH RECURSIVE chain(task_id, parent_task_id, depth) AS (
+    SELECT attempt.id, attempt.retry_of_task_id, 0
     FROM agent_task_queue attempt
     WHERE attempt.id = $1
     UNION ALL
-    SELECT parent.id, parent.retry_of_task_id
+    SELECT parent.id, parent.retry_of_task_id, chain.depth + 1
     FROM agent_task_queue parent
     JOIN chain ON parent.id = chain.parent_task_id
 )
-SELECT chain.task_id FROM chain WHERE chain.parent_task_id IS NULL LIMIT 1
+SELECT
+    (SELECT root.task_id FROM chain root WHERE root.parent_task_id IS NULL LIMIT 1) AS turn_id,
+    (SELECT COALESCE(MAX(step.depth), 0) FROM chain step)::int AS attempt_depth
 `
+
+type GetChannelReplyTurnRow struct {
+	TurnID       pgtype.UUID `json:"turn_id"`
+	AttemptDepth int32       `json:"attempt_depth"`
+}
 
 // ---------------------------------------------------------------------------
 // Reply delivery ownership (channel_reply_delivery).
@@ -1889,14 +1917,15 @@ SELECT chain.task_id FROM chain WHERE chain.parent_task_id IS NULL LIMIT 1
 // proves it still holds the lease when it records what happened.
 // ---------------------------------------------------------------------------
 // The root of a task's automatic-retry chain — the user turn all its attempts
-// belong to. A retry runs under a new task id and must finish the reply its
-// previous attempt started, so ownership is keyed by this rather than by any
-// guess about which pending reply looked closest.
-func (q *Queries) GetChannelReplyTurnID(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, getChannelReplyTurnID, id)
-	var task_id pgtype.UUID
-	err := row.Scan(&task_id)
-	return task_id, err
+// belong to — and how far down the chain this attempt sits. A retry runs under
+// a new task id and must finish the reply its previous attempt started, so
+// ownership is keyed by the root; depth is what stops an earlier attempt's late
+// frame from taking the turn back off the retry that superseded it.
+func (q *Queries) GetChannelReplyTurn(ctx context.Context, id pgtype.UUID) (GetChannelReplyTurnRow, error) {
+	row := q.db.QueryRow(ctx, getChannelReplyTurn, id)
+	var i GetChannelReplyTurnRow
+	err := row.Scan(&i.TurnID, &i.AttemptDepth)
+	return i, err
 }
 
 const getChannelTaskDelivery = `-- name: GetChannelTaskDelivery :one
