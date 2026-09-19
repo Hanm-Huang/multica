@@ -441,6 +441,7 @@ type ChannelOutboundMessage struct {
 }
 
 type ChannelReplyDelivery struct {
+	TurnID         pgtype.UUID        `json:"turn_id"`
 	TaskID         pgtype.UUID        `json:"task_id"`
 	BindingID      pgtype.UUID        `json:"binding_id"`
 	InstallationID pgtype.UUID        `json:"installation_id"`
@@ -450,6 +451,8 @@ type ChannelReplyDelivery struct {
 	SendState      string             `json:"send_state"`
 	MessageID      string             `json:"message_id"`
 	ChunksSent     int32              `json:"chunks_sent"`
+	OwnerToken     pgtype.UUID        `json:"owner_token"`
+	OwnerExpiresAt pgtype.Timestamptz `json:"owner_expires_at"`
 	SettledReason  string             `json:"settled_reason"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`

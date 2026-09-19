@@ -1359,94 +1359,140 @@ SELECT EXISTS (
 -- ---------------------------------------------------------------------------
 -- Reply delivery ownership (channel_reply_delivery).
 --
--- The streamed placeholder, the final answer and the failure notice run on
--- different code paths and, across replicas, in different processes. These
--- queries are the only thing that makes them agree on who owns a task's reply
--- and what the provider has already accepted.
+-- One user turn, one owner, one reply. Every path that can put a message in a
+-- chat proves it holds the turn's lease before it calls the provider, and
+-- proves it still holds the lease when it records what happened.
 -- ---------------------------------------------------------------------------
 
--- name: EnsureChannelReplyDelivery :one
--- Streaming claim. Creates the row on the first text frame and otherwise
--- returns the row as it stands, so a frame can see that terminal delivery has
--- already taken over (and must not open a second message).
+-- name: GetChannelReplyTurnID :one
+-- The root of a task's automatic-retry chain — the user turn all its attempts
+-- belong to. A retry runs under a new task id and must finish the reply its
+-- previous attempt started, so ownership is keyed by this rather than by any
+-- guess about which pending reply looked closest.
+WITH RECURSIVE chain(task_id, parent_task_id) AS (
+    SELECT attempt.id, attempt.retry_of_task_id
+    FROM agent_task_queue attempt
+    WHERE attempt.id = $1
+    UNION ALL
+    SELECT parent.id, parent.retry_of_task_id
+    FROM agent_task_queue parent
+    JOIN chain ON parent.id = chain.parent_task_id
+)
+SELECT chain.task_id FROM chain WHERE chain.parent_task_id IS NULL LIMIT 1;
+
+-- name: AcquireChannelReplyDelivery :one
+-- Take the turn's delivery lease, creating the row on first use. Returns no
+-- row when the turn is settled, when a live owner holds it, or when a
+-- streaming path asks for a reply the final answer has taken over — the three
+-- cases where this caller must not touch the provider.
+--
+-- An expired lease is a process that died mid-delivery. Its successor gets the
+-- turn, but never a clean slate: send_state survives, so an outstanding send
+-- stays outstanding rather than being silently retried.
 INSERT INTO channel_reply_delivery (
-    task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state
-) VALUES ($1, $2, $3, $4, $5, 'streaming', 'none')
-ON CONFLICT (task_id) DO UPDATE SET updated_at = now()
+    turn_id, task_id, binding_id, installation_id, channel_type, chat_id,
+    phase, send_state, owner_token, owner_expires_at
+) VALUES (
+    @turn_id, @task_id, @binding_id, @installation_id, @channel_type, @chat_id,
+    @phase, 'none', @owner_token, now() + make_interval(secs => @lease_seconds::double precision)
+)
+ON CONFLICT (turn_id) DO UPDATE
+SET task_id = EXCLUDED.task_id,
+    phase = CASE WHEN EXCLUDED.phase = 'terminal' THEN 'terminal' ELSE channel_reply_delivery.phase END,
+    owner_token = EXCLUDED.owner_token,
+    owner_expires_at = EXCLUDED.owner_expires_at,
+    updated_at = now()
+WHERE channel_reply_delivery.phase <> 'settled'
+  AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
+  AND NOT (EXCLUDED.phase = 'streaming' AND channel_reply_delivery.phase = 'terminal')
 RETURNING *;
 
--- name: ClaimChannelReplyDeliveryTerminal :one
--- Terminal claim. Succeeds from any phase but 'settled', so an interrupted
--- delivery can be resumed from chunks_sent while a second completion event for
--- an already finished reply returns no row and is dropped.
-INSERT INTO channel_reply_delivery (
-    task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state
-) VALUES ($1, $2, $3, $4, $5, 'terminal', 'none')
-ON CONFLICT (task_id) DO UPDATE SET phase = 'terminal', updated_at = now()
-WHERE channel_reply_delivery.phase <> 'settled'
-RETURNING *;
+-- name: GetChannelReplyDelivery :one
+-- Read without taking the lease, so a caller that lost the race can tell
+-- "someone else is working on it" from "this turn is finished".
+SELECT * FROM channel_reply_delivery WHERE turn_id = $1;
+
+-- name: ReleaseChannelReplyDelivery :execrows
+-- Hand the turn back so the next path does not wait out the lease.
+UPDATE channel_reply_delivery
+SET owner_token = NULL, owner_expires_at = NULL, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2;
+
+-- name: RenewChannelReplyDelivery :execrows
+-- Prove the turn is still ours and push the lease out. Terminal delivery holds
+-- a turn across several scheduler rounds — edit pacing, a 429 backoff — so it
+-- re-proves ownership before each Telegram call rather than trusting a lease
+-- taken minutes earlier. No rows means another process took the turn over, and
+-- this one must stop.
+UPDATE channel_reply_delivery
+SET owner_expires_at = now() + make_interval(secs => sqlc.arg(lease_seconds)::double precision), updated_at = now()
+WHERE turn_id = sqlc.arg(turn_id) AND owner_token = sqlc.arg(owner_token) AND phase <> 'settled';
 
 -- name: MarkChannelReplyDeliverySending :execrows
--- Claims the one and only placeholder send. Nothing may be in flight or
--- accepted already, and terminal delivery must not have taken the reply over.
+-- Publish a send before making it, so any other process reads "a send is
+-- outstanding" rather than "nothing has been sent". A resolved earlier send
+-- does not block the next part of a multi-part answer; an unresolved one does,
+-- because that is the case where nobody knows what is already in the chat.
 UPDATE channel_reply_delivery
 SET send_state = 'in_flight', updated_at = now()
-WHERE task_id = $1 AND phase = 'streaming' AND send_state = 'none';
+WHERE turn_id = $1 AND owner_token = $2 AND send_state NOT IN ('in_flight', 'unknown');
 
--- name: RecordChannelReplyDeliveryMessage :execrows
--- The provider returned an id: the reply now has a message every later path
--- edits instead of re-sending.
+-- name: RecordChannelReplyDeliveryPlaceholder :execrows
+-- The placeholder landed. It gives the turn an editable message; it delivers
+-- no part of the final answer, so chunks_sent stays where it is.
 UPDATE channel_reply_delivery
-SET send_state = 'known', message_id = $2, chunks_sent = GREATEST(chunks_sent, 1), updated_at = now()
-WHERE task_id = $1 AND send_state = 'in_flight';
+SET send_state = 'known', message_id = $3, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state = 'in_flight';
+
+-- name: RecordChannelReplyDeliveryChunk :execrows
+-- A part of the final answer landed. message_id is only adopted when the turn
+-- has no editable message yet, so later parts never retarget the first one.
+UPDATE channel_reply_delivery
+SET send_state = 'known',
+    message_id = CASE WHEN message_id = '' THEN sqlc.arg(message_id)::text ELSE message_id END,
+    chunks_sent = GREATEST(chunks_sent, sqlc.arg(chunks_sent)::int),
+    updated_at = now()
+WHERE turn_id = sqlc.arg(turn_id) AND owner_token = sqlc.arg(owner_token);
 
 -- name: ResetChannelReplyDeliverySend :execrows
--- The provider definitively refused the send: nothing is in the chat, so the
--- reply may be attempted again.
+-- The provider answered and refused: nothing is in the chat, so the turn may
+-- be attempted again.
 UPDATE channel_reply_delivery
-SET send_state = 'none', updated_at = now()
-WHERE task_id = $1 AND send_state = 'in_flight';
+SET send_state = CASE WHEN message_id = '' THEN 'none' ELSE 'known' END, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND send_state = 'in_flight';
 
 -- name: MarkChannelReplyDeliverySendUnknown :execrows
--- The response was lost. The provider may or may not have posted the message
--- and offers no idempotency key, so delivery stops here rather than risking
--- the duplicate this whole table exists to prevent.
+-- The response was lost. Recorded without the owner check: this is the write
+-- that must survive a caller whose lease expired while its own request hung,
+-- because the alternative is a successor assuming nothing was ever sent.
 UPDATE channel_reply_delivery
 SET send_state = 'unknown', updated_at = now()
-WHERE task_id = $1 AND send_state = 'in_flight';
-
--- name: AdvanceChannelReplyDeliveryChunks :execrows
--- Per-chunk progress, written after each chunk lands so a delivery resumed in
--- another process continues after the last chunk instead of repeating it.
-UPDATE channel_reply_delivery
-SET chunks_sent = $2, updated_at = now()
-WHERE task_id = $1 AND chunks_sent < $2;
+WHERE turn_id = $1 AND send_state = 'in_flight';
 
 -- name: SettleChannelReplyDelivery :execrows
--- Delivery is over. No path may send or edit for this task afterwards.
+-- Delivery is over. Nothing sends or edits for this turn afterwards.
 UPDATE channel_reply_delivery
-SET phase = 'settled', settled_reason = $2, updated_at = now()
-WHERE task_id = $1 AND phase <> 'settled';
+SET phase = 'settled', settled_reason = $3, owner_token = NULL, owner_expires_at = NULL, updated_at = now()
+WHERE turn_id = $1 AND owner_token = $2 AND phase <> 'settled';
 
--- name: MarkChannelReplyDeliveryAwaitingRetry :execrows
--- The attempt failed and the platform will retry it automatically. The
--- placeholder stays in the chat and stays owned, so the retry can finish it
--- rather than opening a second answer beside it.
-UPDATE channel_reply_delivery
-SET phase = 'awaiting_retry', updated_at = now()
-WHERE task_id = $1 AND phase IN ('streaming', 'terminal');
-
--- name: AdoptChannelReplyDeliveryForRetry :one
--- An automatic retry inherits the placeholder its previous attempt left in the
--- chat. Scoped to one binding and to a row a retry actually parked, so two
--- ordinary turns that happen to say the same thing still get one reply each.
-UPDATE channel_reply_delivery
-SET task_id = $1, phase = 'streaming', updated_at = now()
-WHERE task_id = (
-    SELECT parked.task_id FROM channel_reply_delivery parked
-    WHERE parked.binding_id = $2 AND parked.phase = 'awaiting_retry'
-    ORDER BY parked.updated_at DESC
-    LIMIT 1
+-- name: CloseChannelReplyDeliveryTurn :one
+-- End a turn that has no answer to deliver — cancelled, or completed empty —
+-- creating the row when the turn never reached the provider at all. Without
+-- the insert, a first text frame arriving after the cancellation would find
+-- nothing, open a placeholder, and leave it there forever.
+INSERT INTO channel_reply_delivery (
+    turn_id, task_id, binding_id, installation_id, channel_type, chat_id,
+    phase, send_state, settled_reason
+) VALUES (
+    @turn_id, @task_id, @binding_id, @installation_id, @channel_type, @chat_id,
+    'settled', 'none', @settled_reason
 )
-AND NOT EXISTS (SELECT 1 FROM channel_reply_delivery existing WHERE existing.task_id = $1)
+ON CONFLICT (turn_id) DO UPDATE
+SET phase = 'settled',
+    settled_reason = @settled_reason,
+    owner_token = NULL,
+    owner_expires_at = NULL,
+    updated_at = now()
+WHERE channel_reply_delivery.phase <> 'settled'
+  AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
 RETURNING *;
