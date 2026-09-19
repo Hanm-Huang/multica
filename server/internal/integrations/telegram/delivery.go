@@ -10,15 +10,27 @@ package telegram
 // in-process. A process that cannot see the placeholder posts its own copy of
 // the same answer, which is the duplicate users report (GH #8049, #7750).
 //
-// channel_reply_delivery is the shared owner. Every path claims it before
-// touching Telegram and records the outcome against it, so "has this reply
-// already been sent, and as which message?" has one answer for all of them.
+// channel_reply_delivery is the shared owner, and this file is the only way to
+// touch it. Three rules hold everywhere:
+//
+//   - One user turn, one owner. A path takes the turn's lease before it calls
+//     Telegram and proves it still holds the lease when it records what
+//     happened. "The UPDATE is atomic" is not the same as "only one process
+//     delivers".
+//   - A placeholder is not progress. Having an editable message says nothing
+//     about how much of the final answer has been delivered; conflating the
+//     two silently truncates replies.
+//   - A send whose result was lost stays lost. Telegram's sendMessage takes no
+//     caller-supplied idempotency key, so a retry cannot be deduplicated by
+//     the provider. An unknown outcome ends delivery with the evidence kept.
 
 import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -36,110 +48,193 @@ const (
 	deliverySendUnknown  = "unknown"
 )
 
-// maxDeliveryClaimAttempts bounds how long a reply waits for its ownership
-// row. Availability wins after that: losing the answer entirely is worse for
-// the user than the duplicate risk this table exists to remove, so delivery
-// proceeds unowned and says so in the log.
-const maxDeliveryClaimAttempts = 3
+const (
+	// deliveryLeaseTTL has to outlive one Telegram round trip, because the
+	// lease is held across the call: a shorter lease would let a second
+	// process take a turn over while the first is still talking to Telegram.
+	// It is also the longest a dead process can block a turn, so it is not
+	// generous.
+	deliveryLeaseTTL = 30 * time.Second
+	// deliveryRecordTimeout bounds the writes that record what Telegram did.
+	// They run on a context detached from the caller's: the deadline that
+	// killed a send must not also stop us recording that the send happened.
+	deliveryRecordTimeout = 5 * time.Second
+	// deliveryBusyRetry spaces attempts on a turn another process holds.
+	deliveryBusyRetry = 250 * time.Millisecond
+	// maxDeliveryAcquireAttempts bounds those attempts. The lease is what
+	// frees a turn held by a process that died, so this has to outlast one;
+	// it bounds how long a live holder can keep the session's queue waiting.
+	maxDeliveryAcquireAttempts = 240
+	// maxDeliveryClaimErrorAttempts is the budget when the ownership write
+	// itself fails. That is a database problem, not a busy turn: retrying it
+	// for a minute holds the session's queue for a minute, and the reply is no
+	// more deliverable at the end of it.
+	maxDeliveryClaimErrorAttempts = 5
+)
 
-// deliveryMessageID is the Telegram message this reply owns, or 0 when the
-// provider has not given one. An id is only usable once the send that produced
-// it came back: an in-flight or lost send has no id to edit.
-func deliveryMessageID(row db.ChannelReplyDelivery) int64 {
-	if row.SendState != deliverySendKnown || row.MessageID == "" {
+// deliveryOutcome is what Telegram did with one send.
+type deliveryOutcome int
+
+const (
+	// deliveryAccepted — the provider returned a message id.
+	deliveryAccepted deliveryOutcome = iota
+	// deliveryRefused — the provider answered and refused. Nothing is in the
+	// chat, so the send may be attempted again.
+	deliveryRefused
+	// deliveryUnknown — no answer came back. The message may be in the chat.
+	deliveryUnknown
+)
+
+// deliveryStatus is why an acquire did not hand over the turn.
+type deliveryStatus int
+
+const (
+	deliveryAcquired deliveryStatus = iota
+	// deliveryBusy — another process holds a live lease. Retry.
+	deliveryBusy
+	// deliveryClosed — the turn is settled, or the final answer has taken over
+	// a reply a streaming frame wanted. Stop.
+	deliveryClosed
+)
+
+// deliveryLease is this process's hold on one turn's reply, together with the
+// state it found. Every write goes through the lease, so a caller cannot
+// record an outcome against a turn it no longer owns.
+type deliveryLease struct {
+	turnID pgtype.UUID
+	token  pgtype.UUID
+	row    db.ChannelReplyDelivery
+}
+
+// messageID is the Telegram message this turn owns, or 0 when there is none to
+// edit. An in-flight or lost send has no usable id.
+func (l *deliveryLease) messageID() int64 {
+	if l == nil || l.row.SendState != deliverySendKnown || l.row.MessageID == "" {
 		return 0
 	}
-	id, err := strconv.ParseInt(row.MessageID, 10, 64)
+	id, err := strconv.ParseInt(l.row.MessageID, 10, 64)
 	if err != nil {
 		return 0
 	}
 	return id
 }
 
-// openStreamDelivery claims the streaming half of a task's reply and reports
-// the ownership row a frame must respect. ok is false when the frame must not
-// touch Telegram at all.
-//
-// tryAdopt asks whether this reply might be inheriting a previous attempt's
-// placeholder. Only the first frame of a task needs to ask: adoption can only
-// win before the task has a row of its own, and the query is an update with a
-// subselect on a path that runs for every text frame of every reply.
-func (o *Outbound) openStreamDelivery(ctx context.Context, target *replyTarget, tryAdopt bool) (db.ChannelReplyDelivery, bool) {
-	if tryAdopt {
-		// An automatic retry inherits the placeholder its previous attempt
-		// left in the chat, so one user turn keeps one answer instead of
-		// gaining a second beside it. Scoped to a row a retry actually parked:
-		// two ordinary turns still get one reply each, even when they happen
-		// to say the same thing.
-		row, err := o.q.AdoptChannelReplyDeliveryForRetry(ctx, db.AdoptChannelReplyDeliveryForRetryParams{
-			TaskID:    target.taskID,
-			BindingID: target.bindingID,
-		})
-		if err == nil {
-			return row, true
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			o.logger.WarnContext(ctx, "telegram outbound: retry placeholder lookup failed", "error", err)
-			return db.ChannelReplyDelivery{}, false
-		}
+// chunksSent is how many parts of the final answer are already in the chat.
+func (l *deliveryLease) chunksSent() int {
+	if l == nil {
+		return 0
 	}
+	return int(l.row.ChunksSent)
+}
 
-	row, err := o.q.EnsureChannelReplyDelivery(ctx, db.EnsureChannelReplyDeliveryParams{
+func (l *deliveryLease) sendState() string {
+	if l == nil {
+		return deliverySendNone
+	}
+	return l.row.SendState
+}
+
+// turnIDFor maps a task to the user turn it belongs to: the root of its
+// automatic-retry chain. A retry runs under a new task id and has to finish
+// the reply its previous attempt started rather than answer beside it.
+//
+// Falling back to the task's own id is right for anything this lineage does
+// not cover — a task with no queue row is its own turn — and keeps delivery
+// working rather than failing closed on a lookup.
+func (o *Outbound) turnIDFor(ctx context.Context, taskID pgtype.UUID) pgtype.UUID {
+	turnID, err := o.q.GetChannelReplyTurnID(ctx, taskID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			o.logger.WarnContext(ctx, "telegram outbound: retry lineage lookup failed; treating the task as its own turn",
+				"task_id", uuidText(taskID), "error", err)
+		}
+		return taskID
+	}
+	if !turnID.Valid {
+		return taskID
+	}
+	return turnID
+}
+
+// acquireDelivery takes the turn's lease for one of the delivery phases.
+func (o *Outbound) acquireDelivery(ctx context.Context, target *replyTarget, turnID pgtype.UUID, phase string) (*deliveryLease, deliveryStatus, error) {
+	token := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	row, err := o.q.AcquireChannelReplyDelivery(ctx, db.AcquireChannelReplyDeliveryParams{
+		TurnID:         turnID,
 		TaskID:         target.taskID,
 		BindingID:      target.bindingID,
 		InstallationID: target.installationID,
 		ChannelType:    string(TypeTelegram),
 		ChatID:         target.channelChatID,
+		Phase:          phase,
+		OwnerToken:     token,
+		LeaseSeconds:   o.leaseSeconds(),
 	})
-	if err != nil {
-		// Fail closed. A stream frame is decoration — the final answer still
-		// lands — so skipping it costs nothing, while sending without knowing
-		// whether a placeholder already exists is exactly the duplicate.
-		o.logger.WarnContext(ctx, "telegram outbound: reply ownership unavailable; skipping stream frame", "error", err)
-		return db.ChannelReplyDelivery{}, false
+	if err == nil {
+		return &deliveryLease{turnID: turnID, token: token, row: row}, deliveryAcquired, nil
 	}
-	return row, true
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, deliveryBusy, err
+	}
+
+	// No row means the turn was refused, and the three reasons need different
+	// answers: settled and taken-over are final, a live owner is not.
+	current, readErr := o.q.GetChannelReplyDelivery(ctx, turnID)
+	if readErr != nil {
+		if errors.Is(readErr, pgx.ErrNoRows) {
+			// Raced with a concurrent close; nothing to deliver.
+			return nil, deliveryClosed, nil
+		}
+		return nil, deliveryBusy, readErr
+	}
+	if current.Phase == deliveryPhaseSettled {
+		return nil, deliveryClosed, nil
+	}
+	if phase == deliveryPhaseStreaming && current.Phase == deliveryPhaseTerminal {
+		return nil, deliveryClosed, nil
+	}
+	return nil, deliveryBusy, nil
 }
 
-// claimStreamSend takes the single placeholder send for this reply. Only one
-// caller can win, across every process: the loser edits the winner's message
-// once its id lands, or waits, but never opens a second one.
-func (o *Outbound) claimStreamSend(ctx context.Context, taskID pgtype.UUID) bool {
-	rows, err := o.q.MarkChannelReplyDeliverySending(ctx, taskID)
+// releaseDelivery hands the turn back so the next path does not wait out the
+// lease. Best effort: an unreleased lease expires on its own.
+func (o *Outbound) releaseDelivery(ctx context.Context, lease *deliveryLease) {
+	if lease == nil {
+		return
+	}
+	ctx, cancel := o.recordContext(ctx)
+	defer cancel()
+	if _, err := o.q.ReleaseChannelReplyDelivery(ctx, db.ReleaseChannelReplyDeliveryParams{
+		TurnID:     lease.turnID,
+		OwnerToken: lease.token,
+	}); err != nil {
+		o.logger.WarnContext(ctx, "telegram outbound: releasing the delivery lease failed", "error", err)
+	}
+}
+
+// claimSend publishes a send before it is made, so any other process reads
+// "a send is outstanding" rather than "nothing has been sent".
+func (o *Outbound) claimSend(ctx context.Context, lease *deliveryLease) bool {
+	rows, err := o.q.MarkChannelReplyDeliverySending(ctx, db.MarkChannelReplyDeliverySendingParams{
+		TurnID:     lease.turnID,
+		OwnerToken: lease.token,
+	})
 	if err != nil {
-		o.logger.WarnContext(ctx, "telegram outbound: placeholder claim failed", "error", err)
+		o.logger.WarnContext(ctx, "telegram outbound: publishing the send failed; not sending", "error", err)
 		return false
 	}
 	return rows == 1
 }
 
-// recordStreamSend writes what Telegram did with the placeholder.
-//
-// The distinction that matters is refused vs unknown. A parsed API rejection
-// means nothing is in the chat and the reply may be attempted again. A
-// transport failure means Telegram may well have posted the message and the
-// response was lost on the way back — and sendMessage has no caller-supplied
-// idempotency key, so a second attempt cannot be deduplicated by the provider.
-// That case stops delivery and keeps the evidence instead of guessing.
-func (o *Outbound) recordStreamSend(ctx context.Context, taskID pgtype.UUID, messageID int64, sendErr error) {
-	var query func() (int64, error)
+// classifySend turns a Bot API result into what the turn now knows.
+func classifySend(err error) deliveryOutcome {
 	switch {
-	case sendErr == nil:
-		query = func() (int64, error) {
-			return o.q.RecordChannelReplyDeliveryMessage(ctx, db.RecordChannelReplyDeliveryMessageParams{
-				TaskID:    taskID,
-				MessageID: strconv.FormatInt(messageID, 10),
-			})
-		}
-	case isDefiniteRejection(sendErr):
-		query = func() (int64, error) { return o.q.ResetChannelReplyDeliverySend(ctx, taskID) }
+	case err == nil:
+		return deliveryAccepted
+	case isDefiniteRejection(err):
+		return deliveryRefused
 	default:
-		o.logger.WarnContext(ctx, "telegram outbound: placeholder send result unknown; delivery stops rather than risk a duplicate",
-			"task_id", uuidText(taskID), "error", sendErr)
-		query = func() (int64, error) { return o.q.MarkChannelReplyDeliverySendUnknown(ctx, taskID) }
-	}
-	if _, err := query(); err != nil {
-		o.logger.WarnContext(ctx, "telegram outbound: recording placeholder send failed", "error", err)
+		return deliveryUnknown
 	}
 }
 
@@ -151,57 +246,103 @@ func isDefiniteRejection(err error) bool {
 	return errors.As(err, &ae)
 }
 
-// claimTerminalDelivery hands the reply to terminal delivery. It succeeds from
-// any phase but settled, so an interrupted delivery resumes from the chunk it
-// reached, while a second completion event for a reply that already finished
-// gets nothing and is dropped.
-func (o *Outbound) claimTerminalDelivery(ctx context.Context, target *replyTarget) (db.ChannelReplyDelivery, bool, error) {
-	row, err := o.q.ClaimChannelReplyDeliveryTerminal(ctx, db.ClaimChannelReplyDeliveryTerminalParams{
+// recordSend writes what Telegram did. placeholder distinguishes the streamed
+// message, which gives the turn something to edit, from a part of the final
+// answer, which is progress. chunksSent is ignored for a placeholder.
+func (o *Outbound) recordSend(ctx context.Context, lease *deliveryLease, placeholder bool, messageID int64, chunksSent int, sendErr error) deliveryOutcome {
+	outcome := classifySend(sendErr)
+	ctx, cancel := o.recordContext(ctx)
+	defer cancel()
+
+	var err error
+	switch outcome {
+	case deliveryAccepted:
+		if placeholder {
+			_, err = o.q.RecordChannelReplyDeliveryPlaceholder(ctx, db.RecordChannelReplyDeliveryPlaceholderParams{
+				TurnID:     lease.turnID,
+				OwnerToken: lease.token,
+				MessageID:  strconv.FormatInt(messageID, 10),
+			})
+		} else {
+			_, err = o.q.RecordChannelReplyDeliveryChunk(ctx, db.RecordChannelReplyDeliveryChunkParams{
+				TurnID:     lease.turnID,
+				OwnerToken: lease.token,
+				MessageID:  strconv.FormatInt(messageID, 10),
+				ChunksSent: int32(chunksSent),
+			})
+		}
+	case deliveryRefused:
+		_, err = o.q.ResetChannelReplyDeliverySend(ctx, db.ResetChannelReplyDeliverySendParams{
+			TurnID:     lease.turnID,
+			OwnerToken: lease.token,
+		})
+	default:
+		o.logger.WarnContext(ctx, "telegram outbound: send result unknown; delivery stops rather than risk a duplicate",
+			"turn_id", uuidText(lease.turnID), "error", sendErr)
+		// Deliberately not owner-checked: this write has to land even if our
+		// lease expired while the request hung, because the successor reading
+		// this row must not conclude that nothing was ever sent.
+		_, err = o.q.MarkChannelReplyDeliverySendUnknown(ctx, lease.turnID)
+	}
+	if err != nil {
+		// The row now disagrees with Telegram. Say so loudly: a lost progress
+		// write is what makes a later delivery repeat a part, and a lost
+		// unknown write is what makes it re-send.
+		o.logger.ErrorContext(ctx, "telegram outbound: recording the send outcome failed; delivery state is behind Telegram",
+			"turn_id", uuidText(lease.turnID), "outcome", outcome, "error", err)
+	}
+	return outcome
+}
+
+// settleDelivery ends the turn. Afterwards no path sends or edits for it,
+// including a text frame that was still in flight when the task finished.
+func (o *Outbound) settleDelivery(ctx context.Context, lease *deliveryLease, reason string) {
+	ctx, cancel := o.recordContext(ctx)
+	defer cancel()
+	if _, err := o.q.SettleChannelReplyDelivery(ctx, db.SettleChannelReplyDeliveryParams{
+		TurnID:        lease.turnID,
+		OwnerToken:    lease.token,
+		SettledReason: reason,
+	}); err != nil {
+		o.logger.ErrorContext(ctx, "telegram outbound: settling the reply failed; a late frame may reopen it",
+			"turn_id", uuidText(lease.turnID), "reason", reason, "error", err)
+	}
+}
+
+// closeTurn ends a turn with no answer to deliver — cancelled, or completed
+// empty. It creates the row when the turn never reached Telegram at all:
+// without that, a first text frame arriving after the cancellation would find
+// nothing, open a placeholder, and leave it there with nothing to finish it.
+func (o *Outbound) closeTurn(ctx context.Context, target *replyTarget, turnID pgtype.UUID, reason string) (bool, error) {
+	_, err := o.q.CloseChannelReplyDeliveryTurn(ctx, db.CloseChannelReplyDeliveryTurnParams{
+		TurnID:         turnID,
 		TaskID:         target.taskID,
 		BindingID:      target.bindingID,
 		InstallationID: target.installationID,
 		ChannelType:    string(TypeTelegram),
 		ChatID:         target.channelChatID,
+		SettledReason:  reason,
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return db.ChannelReplyDelivery{}, false, nil
+	if err == nil {
+		return true, nil
 	}
-	if err != nil {
-		return db.ChannelReplyDelivery{}, false, err
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
 	}
-	return row, true, nil
+	// Either already settled, or a live owner holds the turn.
+	current, readErr := o.q.GetChannelReplyDelivery(ctx, turnID)
+	if readErr != nil {
+		return false, readErr
+	}
+	return current.Phase == deliveryPhaseSettled, nil
 }
 
-// advanceDeliveryChunks records how much of a multi-part answer is in the chat,
-// after each part rather than at the end, so a delivery resumed elsewhere
-// continues after the last part instead of repeating it.
-func (o *Outbound) advanceDeliveryChunks(ctx context.Context, taskID pgtype.UUID, sent int) {
-	if _, err := o.q.AdvanceChannelReplyDeliveryChunks(ctx, db.AdvanceChannelReplyDeliveryChunksParams{
-		TaskID:     taskID,
-		ChunksSent: int32(sent),
-	}); err != nil {
-		o.logger.WarnContext(ctx, "telegram outbound: recording chunk progress failed", "error", err)
-	}
-}
-
-// settleDelivery closes a task's reply. Afterwards no path sends or edits for
-// it — including a text frame that was still in flight when the task ended.
-func (o *Outbound) settleDelivery(ctx context.Context, taskID pgtype.UUID, reason string) {
-	if _, err := o.q.SettleChannelReplyDelivery(ctx, db.SettleChannelReplyDeliveryParams{
-		TaskID:        taskID,
-		SettledReason: reason,
-	}); err != nil {
-		o.logger.WarnContext(ctx, "telegram outbound: settling reply delivery failed", "error", err, "reason", reason)
-	}
-}
-
-// parkDeliveryForRetry keeps a failed attempt's placeholder owned so the
-// automatic retry can finish it. Without this the retry runs under a new task
-// id, finds nothing, and posts its answer beside the abandoned one.
-func (o *Outbound) parkDeliveryForRetry(ctx context.Context, taskID pgtype.UUID) {
-	if _, err := o.q.MarkChannelReplyDeliveryAwaitingRetry(ctx, taskID); err != nil {
-		o.logger.WarnContext(ctx, "telegram outbound: parking reply for retry failed", "error", err)
-	}
+// recordContext detaches a write that records what Telegram did from the
+// caller's deadline. The request that timed out is exactly when recording
+// matters most: dropping the write leaves the row claiming a send is still in
+// flight, and that blocks the turn until the lease expires.
+func (o *Outbound) recordContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), deliveryRecordTimeout)
 }
 
 func uuidText(id pgtype.UUID) string {
@@ -211,4 +352,52 @@ func uuidText(id pgtype.UUID) string {
 	}
 	s, _ := text.(string)
 	return s
+}
+
+// renewDelivery re-proves the turn is ours and pushes the lease out. Terminal
+// delivery holds a turn across several scheduler rounds, so it asks again
+// before each Telegram call rather than trusting a lease taken minutes ago.
+// False means another process owns the turn now and this one must stop.
+func (o *Outbound) renewDelivery(ctx context.Context, lease *deliveryLease) bool {
+	rows, err := o.q.RenewChannelReplyDelivery(ctx, db.RenewChannelReplyDeliveryParams{
+		TurnID:       lease.turnID,
+		OwnerToken:   lease.token,
+		LeaseSeconds: o.leaseSeconds(),
+	})
+	if err != nil {
+		o.logger.WarnContext(ctx, "telegram outbound: renewing the delivery lease failed; not sending", "error", err)
+		return false
+	}
+	return rows == 1
+}
+
+// inheritedSend reports a send this process did not make and cannot resolve.
+// Acquiring a turn whose previous owner died mid-send does not mean nothing
+// was sent — it means nobody knows. Recording that is what stops the successor
+// from posting a second copy, and what lets the turn finish instead of waiting
+// on a lease forever.
+func (o *Outbound) inheritedSend(ctx context.Context, lease *deliveryLease) bool {
+	switch lease.sendState() {
+	case deliverySendUnknown:
+		return true
+	case deliverySendInFlight:
+		o.logger.WarnContext(ctx, "telegram outbound: inherited a send from a process that stopped; outcome unknown",
+			"turn_id", uuidText(lease.turnID))
+		recordCtx, cancel := o.recordContext(ctx)
+		defer cancel()
+		if _, err := o.q.MarkChannelReplyDeliverySendUnknown(recordCtx, lease.turnID); err != nil {
+			o.logger.ErrorContext(ctx, "telegram outbound: recording the inherited send failed",
+				"turn_id", uuidText(lease.turnID), "error", err)
+		}
+		return true
+	}
+	return false
+}
+
+// leaseSeconds is the lease length this Outbound hands out.
+func (o *Outbound) leaseSeconds() float64 {
+	if o.leaseTTL > 0 {
+		return o.leaseTTL.Seconds()
+	}
+	return deliveryLeaseTTL.Seconds()
 }

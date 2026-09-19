@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -92,7 +93,7 @@ func auditSetup(t *testing.T, bot *auditBot) (*Outbound, *fakeTelegramOutboundQu
 	bot.messages = make(map[int64]string)
 	srv := httptest.NewServer(http.HandlerFunc(bot.serve))
 	t.Cleanup(srv.Close)
-	q := newTelegramOutboundQueries()
+	q := newTelegramOutboundQueries(t)
 	q.channelOrigin = true
 	o := NewOutbound(q, nil, srv.URL, srv.Client(), nil)
 	c := &auditClock{}
@@ -143,6 +144,33 @@ func auditDrain(t *testing.T, o *Outbound, c *auditClock, sessionID string) {
 			t.Fatal("terminal reply did not settle after 25 requests")
 		}
 	}
+}
+
+// seedRetryChain records that retryTask is an automatic retry of firstTask.
+// Delivery ownership keys on that lineage rather than guessing which pending
+// reply looked closest, so the relationship has to be real for the retry to
+// inherit anything — which is the whole point of the case below.
+func seedRetryChain(t *testing.T, firstTask, retryTask string) {
+	t.Helper()
+	unique := time.Now().UnixNano()
+	fx := testutil.New(testPool, "", "")
+	fx.UserID = fx.User(t, "telegram-delivery", fmt.Sprintf("telegram-delivery-%d@example.test", unique))
+	fx.WorkspaceID = fx.Workspace(t, "telegram-delivery", fmt.Sprintf("telegram-delivery-%d", unique))
+	agentID := fx.Agent(t, "telegram-delivery", "")
+	finished := testutil.Cols{"status": "completed", "completed_at": testutil.Raw("now()")}
+	fx.Task(t, agentID, merged(finished, testutil.Cols{"id": firstTask}))
+	fx.Task(t, agentID, merged(finished, testutil.Cols{"id": retryTask, "retry_of_task_id": firstTask}))
+}
+
+func merged(base, extra testutil.Cols) testutil.Cols {
+	out := testutil.Cols{}
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 func TestAuditLatePartialAfterCompletion(t *testing.T) {
@@ -270,11 +298,14 @@ func TestAuditAutomaticRetryPreservesSingleReply(t *testing.T) {
 	bot := &auditBot{}
 	o, _, c, _ := auditSetup(t, bot)
 	first := telegramTestEvent()
+	retryTask := telegramTestEventFor(3, 5, "").TaskID
+	seedRetryChain(t, first.TaskID, retryTask)
 	o.handleTaskMessage(auditPartial(first))
 	o.handleTaskFailed(events.Event{TaskID: first.TaskID, Type: protocol.EventTaskFailed,
 		Payload: map[string]any{"retry_pending": true}})
 	c.advance(editInterval + time.Millisecond)
 	retry := telegramTestEventFor(3, 5, chatDoneContent(first.Payload))
+	_ = retryTask
 	o.handleTaskMessage(auditPartial(retry))
 	o.enqueueTerminalReply(retry)
 	auditDrain(t, o, c, retry.ChatSessionID)
@@ -341,6 +372,10 @@ func TestAuditReplayAfterInterruptionBetweenChunks(t *testing.T) {
 	a, base, c, srv := auditSetup(t, bot)
 	q := &auditLedgerQueries{fakeTelegramOutboundQueries: base, row: db.ChatMessage{ID: telegramTestUUID(9)}}
 	a.q = q
+	// The interrupted process never releases its lease — it stops existing.
+	// Expiry is what frees the turn, and expiry is database time, so the test
+	// shortens the lease and really waits for it.
+	a.leaseTTL = 100 * time.Millisecond
 	e := telegramTestEventFor(3, 2, strings.Repeat("A", maxMessageUnits)+"tail")
 	a.enqueueTerminalReply(e)
 	reply := a.terminalSessions[e.ChatSessionID].queue[0]
@@ -358,8 +393,10 @@ func TestAuditReplayAfterInterruptionBetweenChunks(t *testing.T) {
 	}
 	// Simulate losing process memory before the next chunk. A replay-capable
 	// caller delivers the same completion against the same durable database.
+	time.Sleep(150 * time.Millisecond)
 	b := NewOutbound(q, nil, srv.URL, srv.Client(), nil)
 	b.now = c.now
+	b.leaseTTL = 100 * time.Millisecond
 	b.enqueueTerminalReply(e)
 	auditDrain(t, b, c, e.ChatSessionID)
 	bot.mu.Lock()
