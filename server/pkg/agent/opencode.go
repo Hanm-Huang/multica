@@ -203,11 +203,14 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	// through the project config file after all. The write is scoped to the
 	// "mcp" key and preserves everything else in the file, which keeps the
 	// guarantee above intact — see opencodeApplyWorkdirMCPConfig.
+	var mcpInjection *opencodeWorkdirMCPInjection
 	if usesV2 {
-		if err := opencodeApplyWorkdirMCPConfig(opts.Cwd, opts.McpConfig, b.cfg.Logger); err != nil {
+		injection, err := opencodeApplyWorkdirMCPConfig(opts.Cwd, opts.McpConfig, b.cfg.Logger)
+		if err != nil {
 			cancel()
 			return nil, err
 		}
+		mcpInjection = injection
 	} else {
 		mcpContent, err := buildOpenCodeMCPConfigContent(opts.McpConfig)
 		if err != nil {
@@ -223,13 +226,29 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	cmd.Env = env
 
+	// Capture how this run reaches its OpenCode service, so a later interrupt
+	// talks to the same one. `--server` can arrive through agent.custom_args, and
+	// the default background service is resolved from the process environment and
+	// working directory — an interrupt missing any of that would report success
+	// against a different service while this session kept running.
+	interruptServer, interruptStandalone := opencodeConnectionFromArgs(args)
+	interruptConn := opencodeRunConnection{
+		cmd:        runtimeCmd,
+		server:     interruptServer,
+		standalone: interruptStandalone,
+		env:        env,
+		dir:        opts.Cwd,
+	}
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		mcpInjection.withdraw(b.cfg.Logger)
 		cancel()
 		return nil, fmt.Errorf("opencode stdout pipe: %w", err)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		mcpInjection.withdraw(b.cfg.Logger)
 		cancel()
 		return nil, fmt.Errorf("opencode stdin pipe: %w", err)
 	}
@@ -239,6 +258,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 
 	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
 		closeStdin()
+		mcpInjection.withdraw(b.cfg.Logger)
 		cancel()
 		return nil, fmt.Errorf("start opencode: %w", err)
 	}
@@ -292,7 +312,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		// recorded as cancelled. Best effort: the signalling below is unchanged
 		// and still runs whether or not this succeeds.
 		if usesV2 {
-			opencodeInterruptSession(runtimeCmd, run.session.get(), b.cfg.Logger)
+			opencodeInterruptSession(interruptConn, run.session.get(), b.cfg.Logger)
 		}
 		if cmd.Process != nil {
 			signalProcessGroup(cmd, syscall.SIGTERM)
@@ -317,6 +337,11 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		exitErr := cmd.Wait()
 		close(procDone)
 		releaseProcessGroup(cmd)
+		// The process is gone, so nothing can rewrite the config underneath this.
+		// Take the injected MCP entries back out of the workdir before the daemon
+		// runs its end-of-task steps: in local-directory mode that workdir is the
+		// user's own checkout and `git add -A` would commit the credentials.
+		mcpInjection.withdraw(b.cfg.Logger)
 		duration := time.Since(startTime)
 
 		// Wait closes the process pipes, so a prompt write still blocked when

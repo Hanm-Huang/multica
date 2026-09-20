@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -99,6 +100,30 @@ func opencodeModelArg(model, thinkingLevel string) (string, bool) {
 	return model + "#" + thinkingLevel, true
 }
 
+// opencodeWorkdirMCPInjection records exactly what the daemon added to
+// <workdir>/opencode.json so the run can take back that and nothing else.
+//
+// It has to be this precise because the file is not the daemon's. The workdir is
+// reused across turns and belongs to the user and the agent: the user may run
+// their own MCP servers out of it, and the agent may edit the file mid-run. So
+// the injection is recorded per server name, together with whatever value that
+// name held beforehand, and withdrawal restores those values rather than
+// rewriting the section.
+type opencodeWorkdirMCPInjection struct {
+	path string
+	// names the daemon wrote, sorted for deterministic logs and tests.
+	names []string
+	// prior holds the pre-injection value of any name that already existed, so
+	// withdrawal puts the user's server back instead of deleting it.
+	prior map[string]json.RawMessage
+	// fileExisted / mcpExisted / mode describe the file before injection, so a
+	// file or section the daemon created is removed again and one it merely
+	// borrowed is left as found.
+	fileExisted bool
+	mcpExisted  bool
+	mode        fs.FileMode
+}
+
 // opencodeApplyWorkdirMCPConfig projects agent.mcp_config into
 // <workdir>/opencode.json, the only per-task channel OpenCode 2.x still honours
 // for MCP. OPENCODE_CONFIG_CONTENT (the 1.x channel), OPENCODE_CLI_CONFIG_CONTENT,
@@ -106,90 +131,177 @@ func opencodeModelArg(model, thinkingLevel string) (string, bool) {
 // and without --standalone, and none of them reach the session: the agent simply
 // runs without the servers, with nothing logged.
 //
-// buildOpenCodeMCPConfigContent explains why the 1.x path injects env instead of
-// writing here — the workdir is reused across turns for the same (agent, issue),
-// and the agent or the user may own settings in this file. That reasoning still
-// holds, so this function never owns the file, only the "mcp" key inside it:
-// every other key is preserved as found, and "mcp" is removed again when
-// mcp_config goes away so a stale server list cannot outlive its configuration.
+// Returns the injection to withdraw when the run ends, or nil when nothing was
+// written. A task with no mcp_config never touches the file at all — not even to
+// tidy a pre-existing "mcp" section, which belongs to whoever put it there.
 //
-// Rewriting through a map does not preserve the key order or formatting of a
-// hand-edited file. That is accepted: JSON object order is not significant, and
-// the alternative is a surgical editor for a file the daemon has to be able to
-// both add to and clean up.
-func opencodeApplyWorkdirMCPConfig(workdir string, raw json.RawMessage, logger *slog.Logger) error {
-	var servers map[string]any
-	if len(raw) > 0 {
-		translated, err := translateMCPConfigForOpenCode(raw)
-		if err != nil {
-			return err
-		}
-		servers = translated
+// The file is written 0600 for as long as the injection is present: MCP entries
+// carry bearer headers, OAuth client secrets and environment values, and in
+// local-directory mode this path is inside the user's own checkout.
+func opencodeApplyWorkdirMCPConfig(workdir string, raw json.RawMessage, logger *slog.Logger) (*opencodeWorkdirMCPInjection, error) {
+	if len(raw) == 0 {
+		return nil, nil
 	}
-
+	servers, err := translateMCPConfigForOpenCode(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(servers) == 0 {
+		return nil, nil
+	}
 	if workdir == "" {
-		// No workdir means no project config file to write into. Only worth
-		// saying anything when there was actually something to deliver.
-		if len(servers) > 0 && logger != nil {
+		// No workdir means no project config file to write into.
+		if logger != nil {
 			logger.Warn("opencode: agent.mcp_config needs a task workdir on OpenCode 2.x; MCP servers were not applied",
 				"servers", len(servers))
 		}
-		return nil
+		return nil, nil
 	}
 
 	path := filepath.Join(workdir, opencodeWorkdirConfigName)
+	doc, mcp, state, err := readOpenCodeWorkdirConfig(path)
+	if err != nil {
+		return nil, err
+	}
+
+	for name, server := range servers {
+		if previous, ok := mcp[name]; ok {
+			state.prior[name] = previous
+		}
+		encoded, err := json.Marshal(server)
+		if err != nil {
+			return nil, fmt.Errorf("opencode mcp_config: marshal %q: %w", name, err)
+		}
+		mcp[name] = encoded
+		state.names = append(state.names, name)
+	}
+	sort.Strings(state.names)
+
+	if err := writeOpenCodeWorkdirConfig(path, doc, mcp, 0o600); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+// withdraw removes the daemon's MCP entries from the workdir config, restoring
+// any user entry the injection shadowed and the file mode it found.
+//
+// This runs when the process is gone, before the daemon's own end-of-task steps.
+// It matters most in local-directory mode, where the workdir is the user's
+// checkout and `git add -A` would otherwise commit the injected credentials onto
+// the delivery branch (see commitEverything in execenv/local_worktree.go).
+//
+// Best effort: the run is already over, and a workdir the agent deleted or
+// rewrote into something unparsable is not worth failing a finished task for.
+func (s *opencodeWorkdirMCPInjection) withdraw(logger *slog.Logger) {
+	if s == nil {
+		return
+	}
+	doc, mcp, current, err := readOpenCodeWorkdirConfig(s.path)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("opencode: could not withdraw injected MCP config; it may contain credentials",
+				"path", s.path, "error", err)
+		}
+		return
+	}
+	if !current.fileExisted {
+		return // the agent removed it; nothing of ours is left on disk
+	}
+
+	for _, name := range s.names {
+		if previous, ok := s.prior[name]; ok {
+			mcp[name] = previous
+		} else {
+			delete(mcp, name)
+		}
+	}
+
+	// Drop a section that only existed to hold the injection, and a file that
+	// only existed to hold that section.
+	if len(mcp) == 0 && !s.mcpExisted {
+		delete(doc, "mcp")
+		if len(doc) == 0 && !s.fileExisted {
+			if err := os.Remove(s.path); err != nil && !errors.Is(err, fs.ErrNotExist) && logger != nil {
+				logger.Warn("opencode: could not remove the config file it created", "path", s.path, "error", err)
+			}
+			return
+		}
+	}
+
+	mode := s.mode
+	if !s.fileExisted {
+		mode = 0o600
+	}
+	if err := writeOpenCodeWorkdirConfig(s.path, doc, mcp, mode); err != nil && logger != nil {
+		logger.Warn("opencode: could not withdraw injected MCP config; it may contain credentials",
+			"path", s.path, "error", err)
+	}
+}
+
+// readOpenCodeWorkdirConfig loads the workdir project config, splitting the
+// "mcp" section out of it, and records what it found for later withdrawal. A
+// missing file reads as an empty document.
+func readOpenCodeWorkdirConfig(path string) (map[string]json.RawMessage, map[string]json.RawMessage, *opencodeWorkdirMCPInjection, error) {
 	doc := map[string]json.RawMessage{}
-	switch existing, err := os.ReadFile(path); {
+	mcp := map[string]json.RawMessage{}
+	state := &opencodeWorkdirMCPInjection{path: path, prior: map[string]json.RawMessage{}, mode: 0o600}
+
+	existing, err := os.ReadFile(path)
+	switch {
 	case err == nil:
+		state.fileExisted = true
 		if err := json.Unmarshal(existing, &doc); err != nil {
-			// Refuse to overwrite a file that cannot be round-tripped: whatever
-			// is in there belongs to the agent or the user. OpenCode would
-			// reject it as well, so failing here turns an opaque CLI error into
-			// one that names the file.
-			return fmt.Errorf("opencode: %s is not valid JSON, refusing to overwrite it: %w", path, err)
+			// Refuse to rewrite a file that cannot be round-tripped: whatever is
+			// in there belongs to the agent or the user. OpenCode would reject it
+			// as well, so failing here turns an opaque CLI error into one that
+			// names the file.
+			return nil, nil, nil, fmt.Errorf("opencode: %s is not valid JSON, refusing to overwrite it: %w", path, err)
+		}
+		if info, err := os.Stat(path); err == nil {
+			state.mode = info.Mode().Perm()
+		}
+		if section, ok := doc["mcp"]; ok {
+			state.mcpExisted = true
+			if err := json.Unmarshal(section, &mcp); err != nil {
+				return nil, nil, nil, fmt.Errorf("opencode: the mcp section of %s is not an object: %w", path, err)
+			}
 		}
 	case errors.Is(err, fs.ErrNotExist):
 		// No project config yet — the common case for a fresh workdir.
 	default:
-		return fmt.Errorf("opencode: read %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("opencode: read %s: %w", path, err)
 	}
+	return doc, mcp, state, nil
+}
 
-	if len(servers) == 0 {
-		if _, present := doc["mcp"]; !present {
-			return nil // nothing of ours to write and nothing to clean up
-		}
-		delete(doc, "mcp")
-	} else {
-		encoded, err := json.Marshal(servers)
+// writeOpenCodeWorkdirConfig folds the mcp section back into doc and replaces
+// path in one step, so a reader — OpenCode itself, or the next turn in the same
+// reused workdir — can never observe a half-written config.
+//
+// Rewriting through a map does not preserve the key order or formatting of a
+// hand-edited file. That is accepted: JSON object order is not significant, and
+// the alternative is a surgical editor for a file the daemon has to be able to
+// both add to and take back.
+func writeOpenCodeWorkdirConfig(path string, doc, mcp map[string]json.RawMessage, mode fs.FileMode) error {
+	if len(mcp) > 0 || func() bool { _, ok := doc["mcp"]; return ok }() {
+		encoded, err := json.Marshal(mcp)
 		if err != nil {
-			return fmt.Errorf("opencode mcp_config: marshal: %w", err)
+			return fmt.Errorf("opencode: encode mcp section: %w", err)
 		}
 		doc["mcp"] = encoded
 	}
-
-	// Our key was the only thing in the file and it is now gone: remove the file
-	// rather than leave an empty object where there was nothing before.
-	if len(doc) == 0 {
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("opencode: remove %s: %w", path, err)
-		}
-		return nil
-	}
-
 	encoded, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("opencode: encode %s: %w", path, err)
 	}
 	encoded = append(encoded, '\n')
-	if err := writeFileAtomic(path, encoded); err != nil {
-		return fmt.Errorf("opencode: write %s: %w", path, err)
-	}
-	return nil
+	return writeFileAtomic(path, encoded, mode)
 }
 
-// writeFileAtomic replaces path in one step so a reader (OpenCode itself, or the
-// next turn in the same reused workdir) can never observe a half-written config.
-func writeFileAtomic(path string, data []byte) error {
+// writeFileAtomic replaces path in one step. mode is applied to the temporary
+// file before the rename, so the contents are never briefly world-readable.
+func writeFileAtomic(path string, data []byte, mode fs.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*")
 	if err != nil {
@@ -207,9 +319,7 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	// CreateTemp makes the file 0600; project config is not a secret and should
-	// stay readable by the agent the same way a hand-written file would be.
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, mode); err != nil {
 		return err
 	}
 	return os.Rename(tmpName, path)
@@ -252,6 +362,44 @@ func (t *opencodeSessionTracker) get() string {
 	return t.id
 }
 
+// opencodeRunConnection is the connection context a run was launched with, so
+// its interrupt reaches the same service the work is actually running on.
+//
+// `opencode run` accepts `--server <url>` (and users can pass one through
+// agent.custom_args), and it resolves the default background service relative to
+// the process environment and working directory. An interrupt that dropped any
+// of that would report success against a different service while the real
+// session kept running.
+type opencodeRunConnection struct {
+	cmd Command
+	// server is the `--server` value the run was launched with, if any.
+	server string
+	// standalone reports that the run owns a private server. That server is a
+	// child of the client, so the existing process-group signalling already
+	// stops it and no interrupt is needed.
+	standalone bool
+	// env and dir mirror the run's process environment and working directory,
+	// which is how the CLI discovers the default service.
+	env []string
+	dir string
+}
+
+// opencodeConnectionFromArgs reads the connection flags out of a run's final
+// argv, after custom_args have been merged in.
+func opencodeConnectionFromArgs(args []string) (server string, standalone bool) {
+	for i, arg := range args {
+		switch {
+		case arg == "--standalone":
+			standalone = true
+		case arg == "--server" && i+1 < len(args):
+			server = args[i+1]
+		case strings.HasPrefix(arg, "--server="):
+			server = strings.TrimPrefix(arg, "--server=")
+		}
+	}
+	return server, standalone
+}
+
 // opencodeInterruptSession asks the OpenCode 2.x service to stop a session. On
 // 2.x this is the only thing that actually stops a run.
 //
@@ -267,26 +415,43 @@ func (t *opencodeSessionTracker) get() string {
 // never observed, or a non-zero exit all degrade to exactly the behaviour
 // without it. It deliberately does not use the run's context: by the time this
 // is called that context is already cancelled, which is what triggered it.
-func opencodeInterruptSession(runtimeCmd Command, sessionID string, logger *slog.Logger) {
+func opencodeInterruptSession(conn opencodeRunConnection, sessionID string, logger *slog.Logger) {
 	if sessionID == "" {
+		return
+	}
+	if conn.standalone {
+		// A private server dies with the process group below; interrupting the
+		// default service here would signal an unrelated session.
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opencodeInterruptTimeout)
 	defer cancel()
 
-	// `opencode api` resolves the running service itself, which keeps the daemon
-	// out of the business of discovering the service URL or its credentials.
-	cmd := runtimeCmd.exec(ctx, "api", "POST", "/api/session/"+sessionID+"/interrupt")
+	args := []string{"api", "POST", "/api/session/" + sessionID + "/interrupt"}
+	if conn.server != "" {
+		args = append(args, "--server", conn.server)
+	}
+	cmd := conn.cmd.exec(ctx, args...)
 	hideAgentWindow(cmd)
-	out, err := cmd.CombinedOutput()
+	// Same environment and working directory as the run, because that is what
+	// the CLI uses to find the default background service.
+	cmd.Env = conn.env
+	cmd.Dir = conn.dir
+	// combinedOutputOwned rather than cmd.CombinedOutput: the context timeout
+	// alone does not bound this call. CombinedOutput waits for EOF on the output
+	// pipes, and an `api` process that exits while a descendant still holds them
+	// keeps the read blocked — with the termination path behind it stuck too.
+	// runOwned puts the call in its own process tree, applies a WaitDelay to the
+	// pipe wait, and kills whatever is left.
+	out, err := combinedOutputOwned(cmd, logger)
 	if err != nil {
 		if logger != nil {
 			logger.Warn("opencode: session interrupt failed; the agent may keep running server-side",
-				"session", sessionID, "error", err, "output", strings.TrimSpace(string(out)))
+				"session", sessionID, "server", conn.server, "error", err, "output", strings.TrimSpace(string(out)))
 		}
 		return
 	}
 	if logger != nil {
-		logger.Info("opencode: session interrupted", "session", sessionID)
+		logger.Info("opencode: session interrupted", "session", sessionID, "server", conn.server)
 	}
 }
