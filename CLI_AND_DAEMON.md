@@ -1109,4 +1109,3 @@ The immutable `runtime_type` selects model discovery, skills paths, and launch b
 the server derives `protocol_family` (`pi` for `omp`). Custom command/path overrides and
 fixed arguments still apply, and the runtime retains its custom-profile provenance.
 Existing profiles and the legacy `--protocol-family` flag retain their original target.
-To move a Pi profile to Oh-My-Pi, create a new profile and rebind its agents.
