@@ -4,14 +4,14 @@
 
 ## 0. 摘要
 
-1. 画布最大短板不是"画布本身"，而是**可观测性**：编辑器画布上看不到任何节点运行状态（`statuses` prop 是死代码），输出/耗时/输入只能在侧边抽屉里看到一部分，节点级明细 API（`workflowRunNodeOptions`）前端零调用。Dify/n8n/Windmill 把"节点上直接看见运行结果"当作默认体验。
-2. 画布基础操作明显低于业界水位：无 minimap、无框选、无复制粘贴快捷键、无本地 Ctrl+Z（服务端 undo/redo API 已存在但没接快捷键）、无节点面板（加节点只有两个按钮）。
+1. 画布最大短板不是"画布本身"，而是**可观测性深度**：编辑器现在已把运行详情映射回节点并对相邻运行边做动画，也能按需打开节点级明细；节点内仍只有状态和语义摘要，完整输出、attempt 历史和事件仍在运行面板。Dify/n8n/Windmill 把"节点上直接看见运行结果"当作默认体验。
+2. 画布基础操作的 P0 已补齐：节点库、MiniMap、复制/删除快捷键、自动布局、服务端撤销/重做入口和连线提示已经接入；框选/剪贴板、连续拖动合并撤销与连线中点插入仍低于业界水位。
 3. 连线的语义完全不可见：schema 里 `source_port`（success/approved/rework/failure）齐全，但画布渲染不区分，条件分支和失败路径看起来和普通连线一模一样；非法连线静默拒绝、无任何提示。
 4. **很多"差距"其实已被自家设计文档承诺**（`agent-workflow-design.md` §3.2/§3.3 明确要求左侧节点库、条件出口标注、连线上"+"插入节点、连续拖动合并撤销），后端 API（版本历史/activate/copy-to-draft、单节点重试、接管、resolve）也已交付——大量工作是前端接线而非新造能力。
-5. RAG 后端检索能力已是业界主流水平（关键词 tsvector + pgvector 两路召回 50 条、RRF 融合、Cohere 协议 rerank、文档/标签过滤），但**面向用户的功能几乎为零**：没有召回测试面板、没有分块查看器、检索结果不返回得分、文档处理只有纯文字任务列表没有进度可视化、没有批量操作。
+5. RAG 后端检索能力已是业界主流水平（关键词 tsvector + pgvector 两路召回 50 条、RRF 融合、Cohere 协议 rerank、文档/标签过滤）；当前页面已提供召回调试面板、处理进度、引用问答、版本/块查看与图谱入口，但 Chunk 分页检查台和批量操作仍未完成。
 6. **聊天与知识库完全没打通**：chat 代码里 0 处 knowledge 引用；唯一通道是内置技能文档教智能体用 `multica knowledge` CLI 自己查。这是用户感知最直接的缺口。
-7. 工程隐患：`@xyflow/react`（12.11.6）和 `elkjs`（0.12.0）被 `workflow-canvas.tsx` import 但没登记进任何 `package.json` / catalog（幽灵依赖，靠 hoist 碰巧可用）。
-8. 引用体验与业界差距大：FastGPT 有"引用阅读器"（浮窗原文高亮 + 多引用导航 + 相关度评分），Kotaemon 在 PDF 里高亮定位；我们的问答页是纯文本答案 + 下方来源卡片，无角标、无原文定位。
+7. 依赖隐患已处理：`@xyflow/react`（12.11.6）和 `elkjs`（0.12.0）已经登记在 workspace catalog、`@multica/views` manifest 与 lockfile；后续仍需关注桌面/Web 构建产物的一致性。
+8. 引用体验已从纯来源列表提升为段落角标 + 来源卡片，并保留查询 ID、实际检索模式和重排状态；与 FastGPT 的原文高亮、多引用导航和 Kotaemon 的 PDF 页内定位相比，Chunk 检查台和精确页内定位仍是后续差距。
 
 ## 1. 调研范围与方法
 
@@ -51,7 +51,7 @@
 | 子项 | 业界做法 | 我们现状 | 差距 | 建议 |
 | --- | --- | --- | --- | --- |
 | 端口类型化 | ComfyUI 端口按数据类型着色、类型不兼容不能连 [S31]；Coze/FlowGram 变量类型引擎校验 [S39]；React Flow `isValidConnection` + handle `connectionindicator` 状态类 [S60] | schema 有 `source_port`（success/approved/rework/failure/default），图校验完整（`graph.ts:105-130`），但画布每个节点只有左右各一个同样式 Handle（`workflow-canvas.tsx:27`） | 用户完全看不见条件/失败/返工出口，"连上了但不知道连的是什么" | **采纳**：渲染命名端口并按出口类型着色；类型/拓扑不匹配的连线直接禁止并给原因 |
-| 运行状态可视化 | Dify 节点状态图标：成功=绿勾、失败=警告色、运行中=蓝色旋转 loader [S2]；n8n 绿勾 + dirty 节点黄三角+边框变色 [S17]；Windmill DAG 每步实时绿/红点 [S46]；ComfyUI 出错节点标记+进度面板 [S32] | 画布有 `statuses` prop 与状态文案（`workflow-canvas.tsx:126,133`）但是**死代码**——唯一调用方不传，也没有任何数据链路喂给它（`workflow-editor-page.tsx:158`）；状态只出现在运行面板列表里（`workflow-run-panel.tsx:29-33`） | 画布上完全看不到运行状态，这是与业界最大的单点差距 | **采纳**（P0 候选）：activation 状态映射为节点描边色+角标图标+运行中动画；数据链路用 WS `workflow_run:updated` + run detail 查询 |
+| 运行状态可视化 | Dify 节点状态图标：成功=绿勾、失败=警告色、运行中=蓝色旋转 loader [S2]；n8n 绿勾 + dirty 节点黄三角+边框变色 [S17]；Windmill DAG 每步实时绿/红点 [S46]；ComfyUI 出错节点标记+进度面板 [S32] | 运行详情查询会把 activation 状态映射到画布节点，节点描边、角标和运行中动画可见；状态由轮询与 WS 失效共同驱动（`workflow-editor-page.tsx`、`workflow-canvas.tsx`） | 节点内完整输出、输入和耗时仍在运行面板查看 | **已落地**；继续补节点内摘要属于 P1 |
 | 节点内嵌输出预览 | ComfyUI 图片直接渲染在节点内 [S32]；Coze 节点卡带试运行结果条 [S38]；Dify 输出进面板+底部 Variable Inspector [S3][S4]；LangSmith 节点 "View LLM Runs" [S42] | 无；输出只在运行面板 Sheet 内展示（`workflow-run-panel.tsx:51`） | 跑完一次运行必须开抽屉才能知道每步产出了什么 | **改造**：节点卡片内显示最近一次输出的单行摘要（截断文本/交付字段名）；完整输出仍在面板；不做节点内完整 JSON/图片渲染 |
 | 错误高亮与单节点重试 | n8n 失败标红+error workflow [S19]；Dify 失败分支橙色高亮 [S5]；Windmill 任意节点 "Re-start from X" [S46] | 后端支持失败节点重试（`retry_node` 按钮，`workflow-run-panel.tsx:53`，`mutations.ts:54`），但画布无失败高亮，重试入口藏在面板 | 失败节点在画布上不突出，重跑入口不可发现 | **采纳**：失败节点红色描边+错误摘要 tooltip+节点级重试按钮 |
 | 节点折叠/展开 | ComfyUI Alt+C [S33]；n8n 组折叠 [S23]；Windmill 组折叠/子流程内联展开 [S45] | 无 | — | **不做**：分组/子流程属 W3（设计文档 §1.3），本期不动 |
@@ -71,11 +71,11 @@
 
 | 子项 | 业界做法 | 我们现状 | 差距 | 建议 |
 | --- | --- | --- | --- | --- |
-| Minimap 小地图 | React Flow MiniMap 可 pannable/zoomable+按节点类型上色 [S64]；n8n 操作时自动出现、1s 无操作隐藏（源码确认）[S22]；Coze 内建 minimap-plugin [S37] | 无（仅 Background+Controls，`workflow-canvas.tsx:219`） | 大图找不到节点；200 节点上限下必然需要 | **采纳**（P0）：React Flow 内建 MiniMap，节点按类型上色，pannable+zoomable |
+| Minimap 小地图 | React Flow MiniMap 可 pannable/zoomable+按节点类型上色 [S64]；n8n 操作时自动出现、1s 无操作隐藏（源码确认）[S22]；Coze 内建 minimap-plugin [S37] | 已接入 React Flow MiniMap，并按节点类型着色；与 Background/Controls 一起提供画布导航（`workflow-canvas.tsx`） | — | **已落地**；保持 |
 | 网格与吸附 | n8n snap-to-grid 默认开（16px）[S22]；ComfyUI 默认关、Shift 临时吸附 [S32]；tldraw 默认关、Cmd 临时开、8px 屏幕像素阈值+等距 gap 提示 [S56] | 只有点阵背景，无吸附 | 手动排版对不齐 | **改造**（P1）：吸附默认关、按住修饰键临时吸附（对齐 tldraw 模式）；网格吸附可后置 |
 | 对齐辅助线 | tldraw 对齐边/中心/角+间距度量线 [S56] | 无 | — | **不做**（P2）：成本高收益低 |
 | 框选多选 | React Flow `selectionOnDrag`/`selectionKey` [S58]；n8n Ctrl+A、方向键选相邻 [S21] | 未配置 selectionOnDrag/selectionKey | 无法快速框选一片节点 | **采纳**（S）：开启框选+全选快捷键 |
-| 复制/粘贴/快捷键 | Dify 完整体系：Del、Mod+C/V/D、Mod+Z/Y、V/H/C 模式切换、Mod+O 自动整理、Mod+1 适配 [S9]；n8n 更全：N 节点面板、Ctrl+K 命令栏、Shift+S 便签、Ctrl+G 分组 [S21] | 仅"复制选中节点"按钮（`workflow-canvas.tsx:200-204`）+Backspace/Delete；无 Ctrl+C/V、无 Ctrl+A、无 Ctrl+Z | 高频操作全靠鼠标，效率显著低于业界 | **采纳**（P0/P1）：Ctrl+C/V/D、Ctrl+A、Ctrl+Z/Y、Delete；节点面板快捷键 |
+| 复制/粘贴/快捷键 | Dify 完整体系：Del、Mod+C/V/D、Mod+Z/Y、V/H/C 模式切换、Mod+O 自动整理、Mod+1 适配 [S9]；n8n 更全：N 节点面板、Ctrl+K 命令栏、Shift+S 便签、Ctrl+G 分组 [S21] | 已有节点库、搜索、N/Ctrl+D/Delete/Escape 等高频快捷键；服务端 undo/redo 已接入按钮，键盘撤销与连续拖动合并仍待补齐 | 快捷键体系和撤销粒度仍低于成熟产品 | **部分落地**；Ctrl+Z/Y 与保存合并列为 P1 |
 | 撤销/重做 | tldraw mark+diff 事务模型：交互打标、连续变更自动合并为一个撤销单元，选择操作不清空 redo 栈 [S55]；React Flow Pro 示例为快照双栈（付费）[S67] | **服务端 undo/redo 已存在**（`POST /history/{undo|redo}` + canUndo/canRedo，`workflow-editor-page.tsx:145-146`，`mutations.ts:22`），但无键盘快捷键，且每次拖动/改动都产生新 revision，撤销粒度过细 | 能力有、体验没有；粒度违背设计文档"连续拖动合并"承诺 | **改造**（P0）：Ctrl+Z/Y 接服务端 API；保存防抖合并（设计文档 §3.3 的 800ms 方案）使一次连续拖动=一个 revision=一步撤销 |
 | 自动布局 | Dify Mod+O Organize [S9]；n8n tidy up 可只整理选中 [S21]；Windmill d3-dag [S30] | 已有：elkjs layered/RIGHT 按钮触发，布局结果持久化到服务端 graph（`workflow-canvas.tsx:168-180`） | 基本达标 | 保持；"只整理选中"P2 |
 | 分组/子流程 | ComfyUI group+Subgraph 可发布为 Blueprint 复用 [S34]；n8n Ctrl+G 组 [S23]；Windmill 组折叠+子流程内联展开 [S45] | 无 | — | **不做**（本期，W3 范围） |
@@ -91,9 +91,9 @@
 | 单节点试运行 | Dify step run：面板填测试值→Run [S3]；n8n Execute step [S17]；Windmill Test this step（前步输出自动预填）/ Test up to step [S46]；Coze 节点 test run 表单自动生成 [S38] | 无 | 调试一个节点要跑完整条流程 | **改造**（P1）：复用后端 test run + 按 node_id 索引的 simulation fixtures，实现"从选定节点开始模拟" |
 | 逐步执行/断点 | LangSmith：Interrupt 指定节点前/后暂停、Continue 恢复、debug mode 逐步走查 [S41][S43] | 无 | — | **不做**（P2）：与人工审核节点的"等待"语义已有重叠，优先级低 |
 | 运行历史列表 | n8n Executions 标签页：按状态/时间筛选，历史执行可 "Copy to editor" 调试 [S25] | 已有：面板内 run 徽章列表+事件流水，2s/3s 轮询+WS 失效（`workflow-run-panel.tsx:16-17`） | 缺状态筛选；入口只有"历史"按钮 | **改造**（P1）：加状态筛选（成功/失败/等待/需要处理） |
-| 节点输入/输出/耗时/日志 | Dify Last run 面板+Tracing 每节点耗时 [S12]；Windmill 步骤级 inputs/result/logs 实时更新 [S46]；Coze 试运行面板三页签 [S37] | 运行面板有状态/attempt/error/output/人工工单/事件流水（`workflow-run-panel.tsx:49-56`）；**耗时未展示**（schema 有 `activeExecutionMs`，`schemas.ts:139`，闲置）；**输入未展示**；节点级明细 API `workflowRunNodeOptions`（`queries.ts:51-57`）**前端零调用** | "每步做了什么、花了多久、进的是什么"不可见；后端能力已在 | **采纳**（P0）：面板补输入/耗时/日志，接线节点级明细 API |
+| 节点输入/输出/耗时/日志 | Dify Last run 面板+Tracing 每节点耗时 [S12]；Windmill 步骤级 inputs/result/logs 实时更新 [S46]；Coze 试运行面板三页签 [S37] | 运行面板展示状态、attempt、错误、输出、人工工单与事件流水；按节点展开时按需读取 `workflowRunNodeOptions`，展示 instructions、attempts、failures、outputs | 单节点运行入口和耗时可视化仍待补齐 | **已落地基础明细**；单节点运行/耗时列为 P1 |
 | 失败重跑 | n8n "Retry with currently saved/original workflow" [S25]；Windmill "Re-start from X" 任意节点续跑 [S46] | 有失败节点 retry_node（新 activation）；无运行级"再次运行"按钮（后端语义支持：再次运行=新 run，设计 §8.4） | 失败后只能单点重试，不能方便地"改完重跑整条" | **改造**（P1）：补"再次运行"入口（预填上次输入） |
-| 人工审批（human-in-the-loop） | Dify Human Input：表单字段+自定义按钮+超时分支+邮件送达 [S13]；n8n Wait on Form Submitted [S26]；Windmill suspend+审批 URL+Slack/Teams 弹窗+禁止发起人自批 [S48] | 已有待办卡（approve/rework/submit）+独立收件箱页（open/closed/expired），但**表单是原始 JSON 文本框**（`workflow-run-panel.tsx:60-96`）；transfer/extend/takeover/resolve/terminate 等 mutation 无 UI 调用（`mutations.ts:58-73`） | 审批人要手写 JSON；转交/延期/接管能力后端有、前端无 | **采纳**（P0/P1）：按节点 outputs schema 动态渲染表单控件（文本/数字/单选/附件）；补转交/延长期限入口 |
+| 人工审批（human-in-the-loop） | Dify Human Input：表单字段+自定义按钮+超时分支+邮件送达 [S13]；n8n Wait on Form Submitted [S26]；Windmill suspend+审批 URL+Slack/Teams 弹窗+禁止发起人自批 [S48] | 运行面板按 `form_snapshot.fields` 动态渲染文本、数字、布尔、JSON/附件字段，并保留无 Schema 时的 JSON 兼容入口；独立收件箱仍以 JSON 兼容入口为主 | 转交、延期、接管和超时处理入口仍待补齐 | **已落地动态表单基础**；收件箱复用与管理动作列为 P1 |
 
 ### 3.5 版本与协作
 
@@ -105,20 +105,20 @@
 
 ### 3.6 画布差距清单（供第②阶段排序）
 
-- **C1** 节点运行状态可视化（含运行中连线动画）——死代码激活+数据链路
-- **C2** 节点面板（搜索/分类/拖入）+框选+复制粘贴/全选/Delete 快捷键
-- **C3** minimap（内建组件，低成本）
+- **C1** 节点运行状态可视化（含运行中连线动画）——已落地；节点内摘要与精准 patch 仍可增强
+- **C2** 节点面板（搜索/分类/拖入）+框选+复制粘贴/全选/Delete 快捷键——基础能力已落地；完整剪贴板与框选体验仍可增强
+- **C3** minimap（内建组件，低成本）——已落地
 - **C4** 条件/返工/失败连线的端口与标签渲染
 - **C5** 非法连线即时校验与原因提示
 - **C6** Ctrl+Z/Y 接服务端 undo/redo + 保存合并粒度
-- **C7** 节点输入/输出/耗时/日志面板（接线闲置 API）
-- **C8** 人工审批动态表单（替代 JSON 文本框）+转交/延期入口
+- **C7** 节点输入/输出/日志明细面板——已落地基础明细；耗时与单节点运行仍待补齐
+- **C8** 人工审批动态表单（替代 JSON 文本框）——已落地；转交/延期入口仍待补齐
 - **C9** 版本历史 UI（草稿/发布徽标+版本列表+回滚/复制为草稿）
 - **C10** 失败节点画布高亮+节点级重试按钮；"再次运行"
 - **C11** 单节点试运行（复用 simulation fixtures）
 - **C12** 连线中点"+"插入节点
 - **C13** 吸附（默认关+修饰键临时开）
-- **C14** 幽灵依赖修复（`@xyflow/react`/`elkjs` 登记 package.json + catalog）
+- **C14** 幽灵依赖修复（`@xyflow/react`/`elkjs` 登记 package.json + catalog）——已落地
 - **C15** WS 事件粗粒度失效 → 运行状态精准 patch（C1 的性能前置）
 
 ## 4. RAG 产品概览
@@ -165,13 +165,13 @@
 | Rerank | 各家均支持；Open WebUI cross-encoder、Dify Cohere/Jina、LlamaIndex 10+ reranker 生态 [S93] | 已支持 `cohere_compatible` rerank provider，`rerank_applied` 标记（`search.go:354-372`） | 达标；默认关闭与业界一致 | 保持 |
 | 可调参数 | Dify TopK 3 / Score Threshold 0.5（rerank 阶段生效）[S80]；RAGFlow 相似度阈值 0.2/向量权重/TopN [S72]；FastGPT 最低相关度+按 tokens 的引用上限 [S75] | 仅 limit（默认 10、上限 50，`search.go:252-255`）；**score 不返回前端**（只有 rank+retrieval_channels，`types.go:233-243`）；RRF k 不可调 | 无法按需调召回量与过滤阈值；得分黑盒 | **采纳**（P1）：暴露 top_k/相似度阈值（模式生效范围与 Dify 对齐）；score 仅管理员诊断视图返回 |
 | 元数据过滤 | Dify 最完整：内置字段+自定义（String/Number/Time）+Automatic/Manual 模式 [S81]；RAGFlow 元数据过滤 [S72] | document_ids / tags / source_kind（`search.go:67-100`） | 无自定义元数据键值过滤 | **改造**（P2）：tags 已覆盖多数场景；自定义元数据后置 |
-| **召回测试面板** | RAGFlow：数据集页"Retrieval testing"，输入查询+临时调参（阈值/权重/TopN/rerank）→结果区展示命中分块+相关性+来源文档，可按文件过滤，参数仅本次生效 [S72]；Dify：侧栏"Retrieval Testing"+**Records 记录全部检索事件**（含生产调用）[S82]；FastGPT 手动搜索测试（官方 issue 确认）[S74] | **完全没有**。最接近的是 `POST /search` API（`router.go:2093`）与 provider 连通性测试 | 这是 FastGPT/Dify/RAGFlow 的招牌功能，也是调优检索设置的唯一工具；我们有 API 无 UI | **采纳**（P0 候选）：知识库内"召回测试"页：查询输入+模式/limit/rerank 参数（仅本次生效）→命中分块列表（内容高亮/来源文档/channels/跳原文）；复用现有 search API |
+| **召回测试面板** | RAGFlow：数据集页"Retrieval testing"，输入查询+临时调参（阈值/权重/TopN/rerank）→结果区展示命中分块+相关性+来源文档，可按文件过滤，参数仅本次生效 [S72]；Dify：侧栏"Retrieval Testing"+**Records 记录全部检索事件**（含生产调用）[S82]；FastGPT 手动搜索测试（官方 issue 确认）[S74] | 知识库页已提供查询、hybrid/keyword/semantic 模式、limit、rerank 与结果元数据（mode、query_id、warnings、channels）；当前仍缺分数/阈值调节与分块检查器 | 参数化调优和可视化分数仍有缺口 | **已落地基础测试面板**；score/threshold/chunk inspector 列为 P1 |
 
 ### 5.4 问答与引用体验
 
 | 子项 | 业界做法 | 我们现状 | 差距 | 建议 |
 | --- | --- | --- | --- | --- |
-| 引用标注样式 | **FastGPT 引用阅读器**：点击引用弹浮窗显示完整原文并高亮被引片段，右上角 7/10 多引用导航，评分标签悬停看详情，授权用户可标注修正，可导出全文 [S76]；Kotaemon：PDF 浏览器内高亮引用+相关度分数+点击定位 [S91]；Dify "Citation and Attribution" 开关 [S83] | ask 页：纯文本答案+下方来源卡片列表（标题+3 行摘要，跳文档页），无角标、无悬浮、无原文定位（`knowledge-ask-page.tsx:29-33`）；后端引用结构含 locator（页码/段落/单元格，`types.go:245-250`），**定位信息已具备但未用于跳转** | 引用无法与原文对照，可信度核查成本高 | **改造**（P1）：答案段落级角标编号+点击展开来源卡片+"查看原文"跳 blocks 定位（blocks API 已有 locator） |
+| 引用标注样式 | **FastGPT 引用阅读器**：点击引用弹浮窗显示完整原文并高亮被引片段，右上角 7/10 多引用导航，评分标签悬停看详情，授权用户可标注修正，可导出全文 [S76]；Kotaemon：PDF 浏览器内高亮引用+相关度分数+点击定位 [S91]；Dify "Citation and Attribution" 开关 [S83] | ask 页已提供答案中的段落级引用标记、引用来源卡片、chunk 回链与文档入口；服务端严格校验引用 ID 必须来自本次检索结果 | 精确页码/段落定位和浮层原文预览仍可增强 | **已落地基础引用体验**；精确 locator/原文浮层列为 P1 |
 | 流式输出 | 各家聊天默认流式 | ask 接口非流式（设计 §8.6 首期决策），界面显示"正在查找/生成" | 等待感强 | **改造**（P2）：SSE 流式，需评估引用校验时序 |
 | 聊天/智能体挂知识库 | Dify Chatbot Context 挂库+Chatflow Knowledge Retrieval 节点（多库）[S83]；Open WebUI 聊天输入 `#` 引用 KB、模型绑定 KB [S88]；AnythingLLM workspace 级嵌入+chat/query 模式 [S86]；FastGPT dataset_search 节点 [S75] | **聊天完全没打通**：`packages/views/chat/` 无 knowledge 引用；服务端 chat/agent 工具无原生 knowledge 能力；唯一通道是内置技能文档教智能体用 `multica knowledge search/read` CLI（`builtin_skills/multica-platform/references/knowledge.md:13-21`） | 用户最直接的期待（在聊天里问、答带引用）落空 | **采纳**（P0 候选）：聊天内引用知识库并渲染引用来源（方案二选一：聊天侧显式挂库 / agent 原生 knowledge 工具+引用回传；第③阶段定） |
 
@@ -179,7 +179,7 @@
 
 | 子项 | 业界做法 | 我们现状 | 差距 | 建议 |
 | --- | --- | --- | --- | --- |
-| 文档列表与索引状态 | RAGFlow 列（Name/Size/Enabled/Chunks/Parse/Status），状态 waiting/running/completed/failed/canceled，按状态/启用/来源过滤 [S73]；Dify 启停/归档/删除+自动停用策略 [S84] | 任务列表纯文字（stage+status，可取消 queued/running/waiting_config，`knowledge-base-page.tsx:97`）；version 状态枚举 processing/ready/unsupported/failed/cancelled 有展示（`knowledge-document-page.tsx:145,158`）；**无进度条、无阶段可视化** | 用户不知道"解析到哪一步了、还要多久、卡在哪" | **采纳**（P0/P1）：文档列表状态徽标（排队/解析中/向量化/已索引/失败）+阶段 stepper（fetch→parse→chunk→embed→extract→activate，后端 stage 字段现成）+失败原因展示 |
+| 文档列表与索引状态 | RAGFlow 列（Name/Size/Enabled/Chunks/Parse/Status），状态 waiting/running/completed/failed/canceled，按状态/启用/来源过滤 [S73]；Dify 启停/归档/删除+自动停用策略 [S84] | 任务列表展示 stage/status、可取消 queued/running/waiting_config，并以进度条和阶段文案呈现 worker 进度；version 状态 processing/ready/unsupported/failed/cancelled 也有展示 | 完整多阶段 stepper、失败原因分层和批量操作仍可增强 | **已落地基础进度可视化**；完整 stepper/批量操作列为 P1 |
 | 批量操作 | RAGFlow 批量启停/解析/取消/元数据编辑/删除 [S73] | 无 | 多文档管理效率低 | **采纳**（P1）：批量删除/重新处理 |
 | 分块查看器 | 见 §5.2 | 无 | — | 同 §5.2 |
 | 权限隔离 | AnythingLLM Admin/Manager/Default+workspace 级 [S87]；Open WebUI KB 级访问控制 [S88] | private/workspace 可见性+创建者集中管理（创建时选择，`knowledge-list-page.tsx:28,66`）；权限校验在服务端逐请求执行 | 符合产品定位（设计 §6.1） | 保持 |
@@ -187,10 +187,10 @@
 ### 5.6 RAG 差距清单（供第②阶段排序）
 
 - **K1** 聊天内引用知识库+引用渲染（chat 与 knowledge 打通）
-- **K2** 召回测试面板（复用 search API，P0 候选）
+- **K2** 召回测试面板——基础查询、模式、limit、rerank、query_id 与 warnings 已落地；score/threshold/chunk inspector 仍待增强
 - **K3** 分块查看器（列表+启停+跳原文；chunk API 已有）
-- **K4** 文档处理进度可视化（状态徽标+阶段 stepper+失败原因）
-- **K5** 引用体验升级（角标+来源卡片+原文定位跳转）
+- **K4** 文档处理进度可视化——基础进度条、stage/status 与取消已落地；完整 stepper/批量操作仍待增强
+- **K5** 引用体验升级——段落角标、来源卡片和 chunk 回链已落地；精确 locator/原文浮层仍待增强
 - **K6** 分块参数化（大小/重叠/分隔符库级设置）
 - **K7** 父子分块（小块检索、父块上下文）
 - **K8** 检索参数暴露（top_k/相似度阈值；score 管理员可见）
