@@ -33,7 +33,7 @@ WHERE channel_reply_delivery.phase <> 'settled'
   -- back: its late frames would rewrite what the user is reading with content
   -- from a run that was superseded.
   AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
-RETURNING turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at
+RETURNING turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at, attempt_depth
 `
 
 type AcquireChannelReplyDeliveryParams struct {
@@ -74,7 +74,6 @@ func (q *Queries) AcquireChannelReplyDelivery(ctx context.Context, arg AcquireCh
 	err := row.Scan(
 		&i.TurnID,
 		&i.TaskID,
-		&i.AttemptDepth,
 		&i.BindingID,
 		&i.InstallationID,
 		&i.ChannelType,
@@ -88,6 +87,7 @@ func (q *Queries) AcquireChannelReplyDelivery(ctx context.Context, arg AcquireCh
 		&i.SettledReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AttemptDepth,
 	)
 	return i, err
 }
@@ -557,7 +557,12 @@ SET phase = 'settled',
     updated_at = now()
 WHERE channel_reply_delivery.phase <> 'settled'
   AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
-RETURNING turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at
+  -- Same one-way rule the claim follows. A cancellation or empty completion
+  -- belonging to an attempt the retry chain has moved past must not end the
+  -- turn: the attempt that superseded it is still delivering, and its answer
+  -- would be dropped as "already settled".
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
+RETURNING turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at, attempt_depth
 `
 
 type CloseChannelReplyDeliveryTurnParams struct {
@@ -590,7 +595,6 @@ func (q *Queries) CloseChannelReplyDeliveryTurn(ctx context.Context, arg CloseCh
 	err := row.Scan(
 		&i.TurnID,
 		&i.TaskID,
-		&i.AttemptDepth,
 		&i.BindingID,
 		&i.InstallationID,
 		&i.ChannelType,
@@ -604,6 +608,7 @@ func (q *Queries) CloseChannelReplyDeliveryTurn(ctx context.Context, arg CloseCh
 		&i.SettledReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AttemptDepth,
 	)
 	return i, err
 }
@@ -1859,7 +1864,7 @@ func (q *Queries) GetChannelOutboundCardByTask(ctx context.Context, arg GetChann
 }
 
 const getChannelReplyDelivery = `-- name: GetChannelReplyDelivery :one
-SELECT turn_id, task_id, attempt_depth, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at FROM channel_reply_delivery WHERE turn_id = $1
+SELECT turn_id, task_id, binding_id, installation_id, channel_type, chat_id, phase, send_state, message_id, chunks_sent, owner_token, owner_expires_at, settled_reason, created_at, updated_at, attempt_depth FROM channel_reply_delivery WHERE turn_id = $1
 `
 
 // Read without taking the lease, so a caller that lost the race can tell
@@ -1870,7 +1875,6 @@ func (q *Queries) GetChannelReplyDelivery(ctx context.Context, turnID pgtype.UUI
 	err := row.Scan(
 		&i.TurnID,
 		&i.TaskID,
-		&i.AttemptDepth,
 		&i.BindingID,
 		&i.InstallationID,
 		&i.ChannelType,
@@ -1884,6 +1888,7 @@ func (q *Queries) GetChannelReplyDelivery(ctx context.Context, turnID pgtype.UUI
 		&i.SettledReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AttemptDepth,
 	)
 	return i, err
 }

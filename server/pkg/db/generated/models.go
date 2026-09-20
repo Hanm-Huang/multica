@@ -443,7 +443,6 @@ type ChannelOutboundMessage struct {
 type ChannelReplyDelivery struct {
 	TurnID         pgtype.UUID        `json:"turn_id"`
 	TaskID         pgtype.UUID        `json:"task_id"`
-	AttemptDepth   int32              `json:"attempt_depth"`
 	BindingID      pgtype.UUID        `json:"binding_id"`
 	InstallationID pgtype.UUID        `json:"installation_id"`
 	ChannelType    string             `json:"channel_type"`
@@ -457,6 +456,7 @@ type ChannelReplyDelivery struct {
 	SettledReason  string             `json:"settled_reason"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	AttemptDepth   int32              `json:"attempt_depth"`
 }
 
 type ChannelTaskDelivery struct {

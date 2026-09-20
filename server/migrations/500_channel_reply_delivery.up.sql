@@ -15,12 +15,10 @@
 -- reply looked closest.
 CREATE TABLE IF NOT EXISTS channel_reply_delivery (
     turn_id UUID NOT NULL,
-    -- The attempt holding the turn most recently, and how far down the retry
-    -- chain it sits. Depth only ever moves forward: once a retry has taken the
-    -- turn, a late frame from an earlier attempt must not take it back and
-    -- rewrite what the user is reading.
+    -- The attempt holding the turn most recently; diagnostics, never identity.
+    -- How far down the retry chain that attempt sits is added by migration 504,
+    -- which is also where a database created by this file gets it.
     task_id UUID NOT NULL,
-    attempt_depth INTEGER NOT NULL DEFAULT 0 CHECK (attempt_depth >= 0),
     binding_id UUID NOT NULL,
     installation_id UUID NOT NULL,
     channel_type TEXT NOT NULL,

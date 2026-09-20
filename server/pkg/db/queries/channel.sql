@@ -1512,4 +1512,9 @@ SET phase = 'settled',
     updated_at = now()
 WHERE channel_reply_delivery.phase <> 'settled'
   AND (channel_reply_delivery.owner_token IS NULL OR channel_reply_delivery.owner_expires_at <= now())
+  -- Same one-way rule the claim follows. A cancellation or empty completion
+  -- belonging to an attempt the retry chain has moved past must not end the
+  -- turn: the attempt that superseded it is still delivering, and its answer
+  -- would be dropped as "already settled".
+  AND EXCLUDED.attempt_depth >= channel_reply_delivery.attempt_depth
 RETURNING *;
