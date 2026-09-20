@@ -75,6 +75,28 @@ export function validateGitRef(ref: string): GitRefValidation {
 }
 
 /**
+ * True when the value can only be a commit SHA, never a branch name.
+ *
+ * Git cannot tell a branch from a tag from a commit by looking at the string —
+ * `v1.2.3` is a legal branch name and `main` is a legal tag — and answering
+ * properly means asking the remote, which the product deliberately does not do.
+ * A full-length hex object id is the one exception: it is unambiguous, and it
+ * is what someone pastes when they mean "this exact commit".
+ *
+ * That matters because a pinned starting point is also the branch a task
+ * delivers back to, and a commit has nothing to merge into. So the UI, which
+ * asks for a branch, declines this one shape and points at the per-task
+ * `--ref` escape hatch instead. The stored grammar (validateGitRef, mirrored
+ * server-side) stays permissive: the CLI and API still accept tags and commits,
+ * because the daemon resolves all three and always has.
+ */
+export function looksLikeCommitSha(value: string): boolean {
+  const trimmed = value.trim();
+  // SHA-1 object ids are 40 hex chars; git's SHA-256 transition uses 64.
+  return /^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(trimmed);
+}
+
+/**
  * Split a pasted GitHub "browse" URL into the clone URL plus the ref it points at.
  *
  * Someone who wants a branch reaches for the URL bar first, and

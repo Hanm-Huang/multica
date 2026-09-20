@@ -29,11 +29,13 @@ interface GithubRefDialogProps {
 }
 
 /**
- * Sets the checkout ref of an already attached `github_repo` resource.
+ * Sets the branch an already attached `github_repo` resource works on.
  *
  * A dialog rather than an inline field: unlike renaming a row, this changes
- * where every future task in the project starts, and the consequence is worth
- * one sentence of explanation the row has no space for.
+ * where every future task in the project starts AND where it delivers, and
+ * that is worth a sentence the row has no space for. The same sentence has to
+ * say what it does not do — the ref is read when a task is claimed, so work
+ * already underway keeps the branch it started on.
  */
 export function GithubRefDialog({
   open,

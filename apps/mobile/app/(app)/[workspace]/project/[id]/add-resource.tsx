@@ -7,15 +7,21 @@
  * validation: URL must look like `https://github.com/owner/repo`. Server
  * is the canonical validator (validateAndNormalizeResourceRef in Go).
  *
- * The optional checkout ref pins where this project's tasks START — empty
- * means the repository's default branch, and a task that passes its own ref
- * still wins. Parity with the web/desktop attach form in
- * packages/views/projects/components/project-resources-section.tsx.
+ * The optional branch is where this project's tasks START and where they open
+ * their pull requests — empty means the repository's default branch, and a
+ * task that passes its own ref still wins. Parity with the web/desktop attach
+ * form in packages/views/projects/components/project-resources-section.tsx,
+ * including declining a full-length commit id: a commit has no branch to
+ * deliver back to, so one-off revisions belong on `repo checkout --ref`.
  */
 import { useCallback, useState } from "react";
 import { Alert, Pressable, View } from "react-native";
 import { useLocalSearchParams, router } from "expo-router";
-import { splitGithubUrlRef, validateGitRef } from "@multica/core/github";
+import {
+  looksLikeCommitSha,
+  splitGithubUrlRef,
+  validateGitRef,
+} from "@multica/core/github";
 import { Text } from "@/components/ui/text";
 import { TextField } from "@/components/ui/text-field";
 import { useCreateProjectResource } from "@/data/mutations/projects";
@@ -47,8 +53,8 @@ export default function AddResourceRoute() {
     [ref],
   );
 
-  const refError = validateGitRef(ref);
-  const valid = GITHUB_PATTERN.test(url.trim()) && refError.ok;
+  const refMessage = refErrorMessage(ref);
+  const valid = GITHUB_PATTERN.test(url.trim()) && refMessage === null;
   const submitting = createResource.isPending;
 
   const onSubmit = useCallback(() => {
@@ -110,7 +116,7 @@ export default function AddResourceRoute() {
         </View>
         <View className="gap-1">
           <Text className="text-xs text-muted-foreground">
-            Branch, tag, or commit (optional)
+            Starting branch (optional)
           </Text>
           <TextField
             value={ref}
@@ -120,15 +126,10 @@ export default function AddResourceRoute() {
             autoCorrect={false}
           />
           <Text
-            className={`text-xs ${refError.ok ? "text-muted-foreground" : "text-destructive"}`}
+            className={`text-xs ${refMessage === null ? "text-muted-foreground" : "text-destructive"}`}
           >
-            {refError.ok
-              ? "Leave empty to start from the repository's default branch."
-              : refError.reason === "too_long"
-                ? "Use at most 255 characters."
-                : refError.reason === "invalid_characters"
-                  ? "A git ref can't contain spaces or any of ~ ^ : ? * [ \\"
-                  : "Not a valid branch, tag, or commit."}
+            {refMessage ??
+              "Tasks start from this branch and open their pull requests against it. Leave empty to use the repository's default branch."}
           </Text>
         </View>
         <View className="gap-1">
@@ -144,4 +145,28 @@ export default function AddResourceRoute() {
       </View>
     </View>
   );
+}
+
+/**
+ * The message to show under the branch field, or null when it is acceptable.
+ *
+ * Mirrors refErrorMessage in
+ * packages/views/projects/components/github-ref-field.tsx. The commit check
+ * runs first on purpose: a commit id is a perfectly valid ref to store — what
+ * makes it wrong here is that this field names a branch to deliver back to.
+ */
+function refErrorMessage(value: string): string | null {
+  if (looksLikeCommitSha(value)) {
+    return "That's a commit, not a branch. Tasks deliver back to the branch they start from — for a one-off revision, pass --ref to multica repo checkout.";
+  }
+  const validation = validateGitRef(value);
+  if (validation.ok) return null;
+  switch (validation.reason) {
+    case "too_long":
+      return "Use at most 255 characters.";
+    case "invalid_characters":
+      return "A branch name can't contain spaces or any of ~ ^ : ? * [ \\";
+    default:
+      return "Not a valid branch name.";
+  }
 }

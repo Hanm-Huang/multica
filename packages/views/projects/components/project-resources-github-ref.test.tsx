@@ -93,8 +93,8 @@ describe("ProjectResourcesSection — github_repo checkout ref", () => {
   it("saves a new ref while preserving the rest of the stored ref", async () => {
     renderWithI18n(<ProjectResourcesSection projectId="p1" />);
 
-    fireEvent.click(screen.getAllByTitle(/change where tasks start/i)[0]!);
-    const input = screen.getByLabelText(/branch, tag, or commit/i);
+    fireEvent.click(screen.getAllByTitle(/change the branch tasks work on/i)[0]!);
+    const input = screen.getByLabelText(/starting branch/i);
     fireEvent.change(input, { target: { value: "release/2026-10" } });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
@@ -116,8 +116,8 @@ describe("ProjectResourcesSection — github_repo checkout ref", () => {
   it("clearing the field drops the key so tasks fall back to the default branch", async () => {
     renderWithI18n(<ProjectResourcesSection projectId="p1" />);
 
-    fireEvent.click(screen.getAllByTitle(/change where tasks start/i)[0]!);
-    fireEvent.change(screen.getByLabelText(/branch, tag, or commit/i), {
+    fireEvent.click(screen.getAllByTitle(/change the branch tasks work on/i)[0]!);
+    fireEvent.change(screen.getByLabelText(/starting branch/i), {
       target: { value: "" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
@@ -135,8 +135,8 @@ describe("ProjectResourcesSection — github_repo checkout ref", () => {
   it("refuses to save a ref git could never resolve", async () => {
     renderWithI18n(<ProjectResourcesSection projectId="p1" />);
 
-    fireEvent.click(screen.getAllByTitle(/change where tasks start/i)[0]!);
-    fireEvent.change(screen.getByLabelText(/branch, tag, or commit/i), {
+    fireEvent.click(screen.getAllByTitle(/change the branch tasks work on/i)[0]!);
+    fireEvent.change(screen.getByLabelText(/starting branch/i), {
       target: { value: "main..dev" },
     });
 
@@ -155,7 +155,7 @@ describe("ProjectResourcesSection — github_repo checkout ref", () => {
     fireEvent.change(urlInput, {
       target: { value: "https://github.com/multica-ai/other" },
     });
-    fireEvent.change(screen.getByLabelText(/branch, tag, or commit/i), {
+    fireEvent.change(screen.getByLabelText(/starting branch/i), {
       target: { value: "main" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
@@ -178,7 +178,7 @@ describe("ProjectResourcesSection — github_repo checkout ref", () => {
     });
 
     const urlInput = screen.getByLabelText(/attach a github repo/i) as HTMLInputElement;
-    const refInput = screen.getByLabelText(/branch, tag, or commit/i) as HTMLInputElement;
+    const refInput = screen.getByLabelText(/starting branch/i) as HTMLInputElement;
     expect(urlInput.value).toBe("https://github.com/multica-ai/other");
     expect(refInput.value).toBe("release/2026-09");
 
@@ -216,7 +216,7 @@ describe("ProjectResourcesSection — github_repo checkout ref", () => {
     fireEvent.change(screen.getByLabelText(/attach a github repo/i), {
       target: { value: "https://github.com/multica-ai/other" },
     });
-    fireEvent.change(screen.getByLabelText(/branch, tag, or commit/i), {
+    fireEvent.change(screen.getByLabelText(/starting branch/i), {
       target: { value: "bad ref" },
     });
 
@@ -226,15 +226,49 @@ describe("ProjectResourcesSection — github_repo checkout ref", () => {
     expect(createMock).not.toHaveBeenCalled();
   });
 
-  it("leaves a repo on the default branch unbadged, so a badge always means pinned", () => {
+  // Clearing a branch used to make the line vanish, which reads the same as
+  // the setting never having existed. An unpinned repo says so instead.
+  it("says 'Default branch' when nothing is pinned, rather than showing nothing", () => {
     renderWithI18n(<ProjectResourcesSection projectId="p1" />);
 
     // `.group` is the row root; the link's immediate parent is only its top line.
     const pinnedRow = screen.getByText("Release line").closest(".group") as HTMLElement;
     expect(within(pinnedRow).queryByText("release/2026-09")).toBeTruthy();
+    expect(within(pinnedRow).queryByText(/default branch/i)).toBeNull();
 
     const plainRow = screen.getByText("multica-ai/docs").closest(".group") as HTMLElement;
-    // Nothing between the link and the hover actions on an unpinned row.
-    expect(within(plainRow).queryByText(/release/i)).toBeNull();
+    expect(within(plainRow).queryByText(/default branch/i)).toBeTruthy();
+    expect(within(plainRow).queryByText("release/2026-09")).toBeNull();
+  });
+
+  // The field asks for a branch because a pinned start is also the PR target,
+  // and a commit has nothing to merge back into. Only a full-length object id
+  // is refused — `v1.2.3` is a legal branch name, so the rest cannot be told
+  // apart without asking the remote, which the product does not do.
+  it("declines a pasted commit id and points at the per-task escape hatch", () => {
+    renderWithI18n(<ProjectResourcesSection projectId="p1" />);
+
+    fireEvent.click(screen.getAllByTitle(/change the branch tasks work on/i)[0]!);
+    fireEvent.change(screen.getByLabelText(/starting branch/i), {
+      target: { value: "5e0b1cfa0a7d6a1a0f4b3f2e1d0c9b8a7f6e5d4c" },
+    });
+
+    const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(screen.getByText(/commit, not a branch/i)).toBeTruthy();
+    expect(screen.getByText(/--ref/)).toBeTruthy();
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a tag-shaped name — it could be a branch, and only the remote knows", async () => {
+    renderWithI18n(<ProjectResourcesSection projectId="p1" />);
+
+    fireEvent.click(screen.getAllByTitle(/change the branch tasks work on/i)[0]!);
+    fireEvent.change(screen.getByLabelText(/starting branch/i), {
+      target: { value: "v1.4.0" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
   });
 });

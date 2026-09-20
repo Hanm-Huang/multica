@@ -1,20 +1,30 @@
 "use client";
 
-import { validateGitRef, type GitRefInvalidReason } from "@multica/core/github";
+import {
+  looksLikeCommitSha,
+  validateGitRef,
+  type GitRefInvalidReason,
+} from "@multica/core/github";
 import { useT } from "../../i18n/use-t";
 
 /**
- * Free-text entry for a `github_repo` resource's checkout ref.
+ * Free-text entry for the branch a project's tasks work on.
  *
- * Free text rather than a branch dropdown on purpose: nothing in the product
+ * Asks for a BRANCH specifically, though the stored field accepts any ref the
+ * daemon can resolve. The reason is delivery: a pinned starting point is also
+ * where tasks open their pull requests, and a tag or a commit has nothing to
+ * merge back into. Tags and commits remain reachable per task through
+ * `multica repo checkout --ref`, which is where a one-off revision belongs.
+ *
+ * That promise cannot be enforced here — `v1.2.3` is a legal branch name and
+ * `main` is a legal tag, so telling them apart means asking the remote, which
+ * the product deliberately does not do. The one shape that is unambiguous is a
+ * full-length object id, and only that is declined.
+ *
+ * Free text rather than a dropdown for the same reason: nothing in the product
  * can list a repository's branches today — the server never touches the
- * repository, and the daemon that holds the bare caches may be offline or
- * lack access to a private repo. A picker would also be strictly less capable,
- * since a tag or a commit SHA is a legitimate answer here.
- *
- * Validation is shape-only and matches the server (validateGitRef in
- * packages/core/github/repo-ref.ts, mirrored in Go). Existence on the remote is
- * deliberately not a precondition for saving configuration.
+ * repository, and the daemon holding the bare caches may be offline or lack
+ * access to a private repo.
  *
  * Shared by the create-project modal and the resource panel so the same
  * decision reads the same way wherever it is made.
@@ -34,8 +44,7 @@ export function GithubRefField({
   id?: string;
 }) {
   const { t } = useT("projects");
-  const validation = validateGitRef(value);
-  const error = validation.ok ? null : refErrorMessage(validation.reason, t);
+  const error = refErrorMessage(value, t);
 
   return (
     <div className="space-y-1">
@@ -72,12 +81,26 @@ export function GithubRefField({
   );
 }
 
-/** True when the field holds something the server would reject. */
+/** True when the field holds something this form will not submit. */
 export function githubRefHasError(value: string): boolean {
-  return validateGitRef(value).ok === false;
+  return validateGitRef(value).ok === false || looksLikeCommitSha(value);
 }
 
+/** The message to show, or null when the value is acceptable. */
 function refErrorMessage(
+  value: string,
+  t: ReturnType<typeof useT<"projects">>["t"],
+): string | null {
+  // Checked before the grammar: a SHA is a perfectly valid ref to store, so
+  // validateGitRef passes it. What makes it wrong HERE is that this field
+  // names a branch to deliver to.
+  if (looksLikeCommitSha(value)) return t(($) => $.resources.ref_error_commit);
+  const validation = validateGitRef(value);
+  if (validation.ok) return null;
+  return grammarErrorMessage(validation.reason, t);
+}
+
+function grammarErrorMessage(
   reason: GitRefInvalidReason,
   t: ReturnType<typeof useT<"projects">>["t"],
 ): string {

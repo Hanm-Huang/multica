@@ -22,7 +22,7 @@ test("pins, edits and clears a repository's checkout ref", async ({ page }) => {
   await page.getByRole("textbox", { name: /project title/i }).fill("Release line");
   await page.getByRole("button", { name: /repos/i }).first().click();
   await page.getByPlaceholder(/github\.com\/owner\/repo/i).fill(REPO);
-  await page.getByLabel(/branch, tag, or commit/i).fill("release/2026-09");
+  await page.getByLabel(/starting branch/i).fill("release/2026-09");
   await page.getByRole("button", { name: /^add$/i }).click();
   await page.getByRole("button", { name: /^create project$/i }).click();
 
@@ -30,15 +30,15 @@ test("pins, edits and clears a repository's checkout ref", async ({ page }) => {
   await expect(page.getByText("release/2026-09")).toBeVisible({ timeout: 15000 });
 
   // Editing an attached resource — the affordance the UI never had.
-  await page.getByTitle(/change where tasks start/i).first().click();
-  await expect(page.getByText(/where should tasks start/i)).toBeVisible();
+  await page.getByTitle(/change the branch tasks work on/i).first().click();
+  await expect(page.getByText(/which branch should tasks work on/i)).toBeVisible();
 
   // A ref git could not resolve is refused before it is stored, rather than
   // failing minutes later inside a task with a repo-cache error.
-  await page.getByLabel(/branch, tag, or commit/i).fill("main..dev");
+  await page.getByLabel(/starting branch/i).fill("main..dev");
   await expect(page.getByRole("button", { name: /^save$/i })).toBeDisabled();
 
-  await page.getByLabel(/branch, tag, or commit/i).fill("v1.4.0");
+  await page.getByLabel(/starting branch/i).fill("v1.4.0");
   await page.getByRole("button", { name: /^save$/i }).click();
   await expect(page.getByText("v1.4.0")).toBeVisible({ timeout: 10000 });
   await expect(page.getByText("release/2026-09")).toHaveCount(0);
@@ -50,9 +50,13 @@ test("pins, edits and clears a repository's checkout ref", async ({ page }) => {
   await expect(page.getByText("multica-ai/multica")).toBeVisible();
 
   // Clearing goes back to the repository's default branch.
-  await page.getByTitle(/change where tasks start/i).first().click();
-  await page.getByLabel(/branch, tag, or commit/i).fill("");
+  await page.getByTitle(/change the branch tasks work on/i).first().click();
+  await page.getByLabel(/starting branch/i).fill("");
   await page.getByRole("button", { name: /^save$/i }).click();
   await expect(page.getByText("v1.4.0")).toHaveCount(0, { timeout: 10000 });
   await expect(page.getByText("multica-ai/multica")).toBeVisible();
+  // Not an empty row: an unpinned repo says which branch it uses, so clearing
+  // is confirmable rather than indistinguishable from the setting not existing.
+  // Exact text, because the success toast also says "Back to the default branch".
+  await expect(page.getByText("Default branch", { exact: true })).toBeVisible();
 });

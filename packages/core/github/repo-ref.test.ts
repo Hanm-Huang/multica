@@ -1,6 +1,11 @@
 // @vitest-environment node
 import { describe, it, expect } from "vitest";
-import { GIT_REF_MAX_LENGTH, splitGithubUrlRef, validateGitRef } from "./repo-ref";
+import {
+  GIT_REF_MAX_LENGTH,
+  looksLikeCommitSha,
+  splitGithubUrlRef,
+  validateGitRef,
+} from "./repo-ref";
 
 describe("validateGitRef", () => {
   it("accepts an empty ref as 'use the default branch'", () => {
@@ -110,5 +115,36 @@ describe("splitGithubUrlRef", () => {
       url: "https://github.com/o/r",
       ref: "dev",
     });
+  });
+});
+
+describe("looksLikeCommitSha", () => {
+  it("recognises full-length object ids", () => {
+    expect(looksLikeCommitSha("5e0b1cfa0a7d6a1a0f4b3f2e1d0c9b8a7f6e5d4c")).toBe(true);
+    expect(looksLikeCommitSha("5E0B1CFA0A7D6A1A0F4B3F2E1D0C9B8A7F6E5D4C")).toBe(true);
+    expect(looksLikeCommitSha("a".repeat(64))).toBe(true);
+    expect(looksLikeCommitSha("  " + "b".repeat(40) + "  ")).toBe(true);
+  });
+
+  it("leaves anything that could plausibly be a branch alone", () => {
+    for (const value of [
+      "main",
+      "release/2026-09",
+      "v1.2.3",
+      "a1b2c3d", // a short SHA is also a legal branch name — not our call to make
+      "deadbeef",
+      "a".repeat(39),
+      "a".repeat(41),
+      "g".repeat(40), // not hex
+      "",
+    ]) {
+      expect(looksLikeCommitSha(value)).toBe(false);
+    }
+  });
+
+  it("is independent of validateGitRef — a SHA is still a valid ref to store", () => {
+    const sha = "5e0b1cfa0a7d6a1a0f4b3f2e1d0c9b8a7f6e5d4c";
+    expect(validateGitRef(sha)).toEqual({ ok: true });
+    expect(looksLikeCommitSha(sha)).toBe(true);
   });
 });

@@ -423,12 +423,40 @@ func writeRepositories(b *strings.Builder, ctx TaskContextForEnv) {
 	}
 	b.WriteString("## Repositories\n\n")
 	b.WriteString("Available in this workspace — `multica repo checkout <url> [--ref <branch-or-sha>]` to fetch (creates a repository checkout on a dedicated branch).\n\n")
+	pinned := false
 	for _, repo := range ctx.Repos {
+		line := "- " + repo.URL
 		if repo.Description != "" {
-			fmt.Fprintf(b, "- %s — %s\n", repo.URL, repo.Description)
-		} else {
-			fmt.Fprintf(b, "- %s\n", repo.URL)
+			line += " — " + repo.Description
 		}
+		// The ref is already applied by the daemon on checkout. It is printed
+		// here so the agent knows which line of work it is on without running
+		// `git branch` first, and — more importantly — so it can target the
+		// same branch when it delivers. Without this the repo reads as if it
+		// were on the default branch.
+		if ref := strings.TrimSpace(repo.Ref); ref != "" {
+			pinned = true
+			line += fmt.Sprintf(" (starts from `%s`)", ref)
+		}
+		b.WriteString(line + "\n")
+	}
+	if pinned {
+		// A project pins a repo because its work lives on that line, so a pull
+		// request that silently targets the repo's default branch is wrong
+		// twice over: it asks to merge into the wrong place, and its diff
+		// carries every commit the pinned branch has that the default lacks.
+		// `gh pr create` defaults to the repo default branch, so the agent has
+		// to pass --base itself — nothing in the platform sets it.
+		//
+		// Stated conditionally because a pin is not necessarily a branch: the
+		// field accepts anything git resolves, and a tag or commit has no
+		// branch to merge back into. Neither the server nor the daemon can
+		// tell the three apart without asking the remote, which the product
+		// deliberately does not do, so the agent resolves it at the point it
+		// already has the repository in hand.
+		b.WriteString("\nA repository that starts from a branch is already checked out there — do not pass `--ref` to get back to it. ")
+		b.WriteString("Deliver to the same line: open pull requests with `gh pr create --base <that-branch>`. ")
+		b.WriteString("If what it starts from is a tag or a commit rather than a branch, treat it as a starting point only and confirm the target branch before opening a pull request.\n")
 	}
 	b.WriteString("\n")
 }
@@ -456,7 +484,8 @@ func writeProjectContext(b *strings.Builder, ctx TaskContextForEnv) {
 			fmt.Fprintf(b, "- %s\n", formatProjectResource(r))
 		}
 		b.WriteString("\nResources are pointers — open them only when relevant to the task. ")
-		b.WriteString("For `github_repo` resources, use `multica repo checkout <url>` to fetch the code. Add `--ref <branch-or-sha>` when a task or handoff names an exact revision.\n\n")
+		b.WriteString("For `github_repo` resources, use `multica repo checkout <url>` to fetch the code. ")
+		b.WriteString("A resource listing a starting point is checked out there automatically — pass `--ref <branch-or-sha>` only to override it, when a task or handoff names a different revision.\n\n")
 	} else {
 		b.WriteString("This project has no resources attached yet.\n\n")
 	}

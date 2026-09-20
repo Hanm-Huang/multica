@@ -227,7 +227,7 @@ describe("CreateProjectModal", () => {
       apiRepoUrl,
     );
     await user.type(
-      screen.getByLabelText(/branch, tag, or commit/i),
+      screen.getByLabelText(/starting branch/i),
       "release/2026-09",
     );
     await user.click(screen.getByRole("button", { name: /^add$/i }));

@@ -716,24 +716,30 @@ function ResourceRow({
         {/* Its own line rather than appended to the link text: a custom label
             takes that slot, and this panel is narrow enough that an inline
             badge truncates the repository name away — which is exactly when
-            someone needs to read both. Always visible, like the worktree
-            badge: that tasks do not start from the default branch is not
-            something to discover on hover. */}
-        {ref.ref && (
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <div className="flex items-center gap-1 pl-[1.375rem] text-micro text-muted-foreground">
-                  <GitBranch className="size-3 shrink-0" />
-                  <span className="truncate">{ref.ref}</span>
-                </div>
-              }
-            />
-            <TooltipContent side="top">
-              {t(($) => $.resources.ref_badge_tooltip, { ref: ref.ref })}
-            </TooltipContent>
-          </Tooltip>
-        )}
+            someone needs to read both.
+            
+            Rendered even when nothing is pinned, showing "Default branch".
+            Without it, clearing a branch makes the line vanish, which reads
+            the same as the setting never having existed — there is no way to
+            confirm from the panel that the repo is deliberately on its
+            default, or that this row has a branch setting at all. */}
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <div className="flex items-center gap-1 pl-[1.375rem] text-micro text-muted-foreground">
+                <GitBranch className="size-3 shrink-0" />
+                <span className="truncate">
+                  {ref.ref || t(($) => $.resources.ref_default_label)}
+                </span>
+              </div>
+            }
+          />
+          <TooltipContent side="top">
+            {ref.ref
+              ? t(($) => $.resources.ref_badge_tooltip, { ref: ref.ref })
+              : t(($) => $.resources.ref_default_tooltip)}
+          </TooltipContent>
+        </Tooltip>
       </div>
     );
   }
