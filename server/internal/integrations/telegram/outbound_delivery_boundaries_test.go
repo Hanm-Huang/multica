@@ -474,3 +474,147 @@ func TestReview8545PostgresFailureNoticeWaitsForALiveLease(t *testing.T) {
 		t.Fatalf("failure notice was lost: reply still reads %q; methods=%v", bot.messages[1], bot.methods)
 	}
 }
+
+// A cancellation or empty completion belonging to an attempt the retry chain
+// has moved past must not end the turn: the attempt that superseded it is
+// still delivering, and its answer would be dropped as already settled.
+func TestReview8545PostgresSupersededAttemptCannotCloseTheTurn(t *testing.T) {
+	bot := &auditBot{}
+	o, _, c, e := review8545Setup(t, bot)
+	oldTask := e.TaskID
+	retryTask := util.UUIDToString(review8545ID())
+	seedRetryChain(t, oldTask, retryTask)
+
+	// The retry takes the turn and starts streaming.
+	o.handleTaskMessage(telegramPartialEvent(retryTask, "retry streaming"))
+
+	// The attempt it superseded completes empty, late.
+	stale := e
+	stale.TaskID = oldTask
+	stale.Payload = protocol.ChatDonePayload{TaskID: oldTask, ChatSessionID: e.ChatSessionID}
+	o.enqueueTerminalReply(stale)
+	auditDrain(t, o, c, stale.ChatSessionID)
+
+	// The retry's answer must still be delivered.
+	retry := e
+	retry.TaskID = retryTask
+	retry.Payload = protocol.ChatDonePayload{TaskID: retryTask, ChatSessionID: e.ChatSessionID, Content: "retry complete answer"}
+	o.enqueueTerminalReply(retry)
+	auditDrain(t, o, c, retry.ChatSessionID)
+
+	review8545MessageCount(t, bot, 1)
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	if bot.messages[1] != "retry complete answer" {
+		t.Fatalf("superseded attempt closed the turn; reply reads %q, methods=%v", bot.messages[1], bot.methods)
+	}
+}
+
+// Losing the lease mid-notice must stop the notice, not merely change what it
+// does next. One provider call per step, and the next step re-proves the turn.
+func TestReview8545PostgresFailureNoticeStopsAfterLosingTheLease(t *testing.T) {
+	bot := &auditBot{failFirstEdit: true}
+	o, _, c, e := review8545Setup(t, bot)
+	o.leaseTTL = 100 * time.Millisecond
+	o.handleTaskMessage(telegramPartialEvent(e.TaskID, "streamed reply"))
+	o.handleTaskFailed(events.Event{TaskID: e.TaskID, ChatSessionID: e.ChatSessionID,
+		Payload: map[string]any{"retry_pending": false}})
+
+	o.terminalMu.Lock()
+	reply := o.terminalSessions[e.ChatSessionID].queue[0]
+	o.terminalMu.Unlock()
+
+	// First step: initialize and take the turn.
+	if result := o.sendNextTerminalRequest(context.Background(), reply); result.done {
+		t.Fatalf("notice finished before making a request: %+v", result)
+	}
+	// Second step: the ambiguous edit. It must come back for another step
+	// rather than retrying inside this one.
+	result := o.sendNextTerminalRequest(context.Background(), reply)
+	if result.done {
+		t.Fatalf("ambiguous edit settled inside one step: %+v", result)
+	}
+	callsBefore, _ := func() (int, bool) {
+		bot.mu.Lock()
+		defer bot.mu.Unlock()
+		return len(bot.methods), true
+	}()
+
+	// Another replica takes the turn over while this one waits.
+	other := review8545Second(o)
+	other.leaseTTL = 100 * time.Millisecond
+	time.Sleep(150 * time.Millisecond)
+	target, err := other.resolveTarget(context.Background(), e, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := other.turnFor(context.Background(), target.taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, status, err := other.acquireDelivery(context.Background(), target, turn, deliveryPhaseTerminal); err != nil || status != deliveryAcquired {
+		t.Fatalf("second replica could not take the turn: status=%v err=%v", status, err)
+	}
+
+	c.advance(time.Minute)
+	if result := o.sendNextTerminalRequest(context.Background(), reply); !result.done {
+		t.Fatalf("delivery continued without the turn: %+v", result)
+	}
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	if len(bot.methods) != callsBefore {
+		t.Fatalf("called Telegram after losing the turn: %v", bot.methods)
+	}
+}
+
+// Quiet is not abandoned. A run can sit in a tool call far longer than any
+// sweep interval, and reclaiming its stream would restart the reply's text
+// from whatever arrives next.
+func TestReview8545PostgresQuietStreamSurvivesTheSweep(t *testing.T) {
+	bot := &auditBot{}
+	o, _, c, e := review8545Setup(t, bot)
+	o.handleTaskMessage(telegramPartialEvent(e.TaskID, "first half"))
+
+	// Hours of silence, the shape of a long tool call.
+	c.advance(3 * time.Hour)
+	o.sweepSettledStreams(context.Background())
+
+	o.mu.Lock()
+	_, held := o.streams[e.TaskID]
+	o.mu.Unlock()
+	if !held {
+		t.Fatal("sweep reclaimed a live reply that was merely quiet")
+	}
+
+	o.handleTaskMessage(telegramPartialEvent(e.TaskID, " second half"))
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
+	if bot.messages[1] != "first half second half" {
+		t.Fatalf("quiet stream lost its prefix: %q; methods=%v", bot.messages[1], bot.methods)
+	}
+}
+
+// The other half of the same rule: once the turn really is over, the sweep
+// does release the local state nothing else can.
+func TestReview8545PostgresSweepReleasesTurnsSettledElsewhere(t *testing.T) {
+	bot := &auditBot{}
+	a, _, c, e := review8545Setup(t, bot)
+	a.handleTaskMessage(telegramPartialEvent(e.TaskID, "streamed on this replica"))
+	b := review8545Second(a)
+	b.enqueueTerminalReply(e)
+	auditDrain(t, b, c, e.ChatSessionID)
+
+	c.advance(streamSweepGrace + time.Second)
+	a.sweepSettledStreams(context.Background())
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.streams) != 0 {
+		t.Fatal("sweep left local state for a turn another replica settled")
+	}
+	for key, schedule := range a.chats {
+		if schedule.refs != 0 {
+			t.Fatalf("chat schedule %v still referenced after the sweep", key)
+		}
+	}
+}

@@ -354,10 +354,17 @@ func (o *Outbound) closeTurn(ctx context.Context, target *replyTarget, turn repl
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return false, err
 	}
-	// Either already settled, or a live owner holds the turn.
+	// Settled, superseded, or held by a live owner — only the last is worth
+	// waiting for.
 	current, readErr := o.q.GetChannelReplyDelivery(ctx, turnID)
 	if readErr != nil {
 		return false, readErr
+	}
+	if turn.depth < current.AttemptDepth {
+		// A later attempt owns this turn. Closing it is not this attempt's to
+		// do, and waiting for the chance would hold the session's queue for a
+		// reply that is already someone else's.
+		return true, nil
 	}
 	return current.Phase == deliveryPhaseSettled, nil
 }
