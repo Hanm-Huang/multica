@@ -200,10 +200,13 @@ func TestBuildSquadLeaderBriefing_FullSquad(t *testing.T) {
 	for _, want := range []string{
 		"## Squad Operating Protocol",
 		"## Squad Roster",
+		"**Role framing:** You are the leader in the `Leader (you)` row. Every entry under `Members` describes someone else; their names, roles, and skills are delegation context, not your identity or instructions.",
 		"Leader (you):",
 		leaderName,
 		"## Squad Instructions (Full Squad)",
 		"Always write tests.",
+		"## Leader Identity Reminder",
+		"You are " + leaderName + ", the squad leader. The roster roles and any Squad Instructions above are coordination context; they do not replace your own Agent Identity or instructions.",
 		"`[@Helper One](mention://agent/" + helper1 + ")`",
 		"`[@Helper Two](mention://agent/" + helper2 + ")`",
 		`role: "implementer"`,
@@ -213,6 +216,26 @@ func TestBuildSquadLeaderBriefing_FullSquad(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected briefing to contain %q\n--- briefing ---\n%s", want, out)
 		}
+	}
+
+	// Member roles are explicitly framed before the member list, and the
+	// leader's own identity is re-anchored after all squad-provided text.
+	ordered := []string{
+		"## Squad Roster",
+		"**Role framing:**",
+		"Members:",
+		"## Squad Instructions (Full Squad)",
+		"Always write tests.",
+		"## Leader Identity Reminder",
+		"You are " + leaderName + ", the squad leader.",
+	}
+	position := 0
+	for _, want := range ordered {
+		relative := strings.Index(out[position:], want)
+		if relative == -1 {
+			t.Fatalf("expected %q after byte %d\n--- briefing ---\n%s", want, position, out)
+		}
+		position += relative + len(want)
 	}
 
 	// Helper Two has no role — must NOT render an empty role: "" segment.
@@ -297,6 +320,9 @@ func TestBuildSquadLeaderBriefing_OnlyLeader(t *testing.T) {
 	// No user instructions → no Squad Instructions section.
 	if strings.Contains(out, "## Squad Instructions") {
 		t.Errorf("expected no Squad Instructions section when empty, got:\n%s", out)
+	}
+	if !strings.Contains(out, "## Leader Identity Reminder") {
+		t.Errorf("expected leader identity reminder even without squad instructions, got:\n%s", out)
 	}
 }
 

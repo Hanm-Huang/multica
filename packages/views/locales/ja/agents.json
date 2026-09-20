@@ -350,7 +350,7 @@
       "unsaved_changes": "保存していない変更"
     },
     "instructions": {
-      "intro": "すべての実行で使用する System Prompt を設定します。Markdown に対応しています。",
+      "intro": "すべての実行で使用する System Prompt を設定します。これはエージェントの動作を導くもので、権限やセキュリティの境界を強制するものではありません。Markdown に対応しています。",
       "system_prompt_label": "System Prompt",
       "placeholder": "このエージェントの役割、専門分野、作業スタイルを定義してください。\n\n# 例\nあなたは React と TypeScript を専門とするフロントエンドエンジニアです。\n\n## 作業スタイル\n- 小さく焦点を絞った PR を作成する — 論理的な変更ごとに1コミット\n- 継承よりコンポジションを優先する\n- 新しいコンポーネントには必ずユニットテストを追加する\n\n## 制約\n- 明示的な承認なしに shared/ の型を変更しない\n- features/ の既存のコンポーネントパターンに従う",
       "system_layer_label": "Multica が管理",
@@ -358,7 +358,7 @@
       "system_layer_show": "表示",
       "system_layer_hide": "隠す",
       "workspace_notes_label": "ワークスペースの補足",
-      "workspace_notes_intro": "チームのコンテキストや好みを下に追加してください。Multica がこのエージェント向けに管理している指示の上に適用されます。Markdown が使えます。",
+      "workspace_notes_intro": "チームのコンテキストや好みを下に追加してください。Multica がこのエージェント向けに管理している指示に加えて動作を導きますが、権限やセキュリティの境界を強制するものではありません。Markdown が使えます。",
       "workspace_notes_placeholder": "このエージェントが常に知っておくべきことを書きます。\n\n# 例\nメインリポジトリは github.com/acme/platform です。\nチャットが日本語でも、タスクは英語で書いてください。\n金曜日はデプロイしません。"
     },
     "env": {
