@@ -157,7 +157,6 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"workflow_command":                   workspaceDelete,
 	"workflow_event":                     workspaceDelete,
 	"workflow_job":                       workspaceDelete,
-	"workflow_node":                      workspaceDelete,
 	"workflow_node_activation":           workspaceDelete,
 	"workflow_node_attempt":              workspaceDelete,
 	"workflow_node_run":                  workspaceDelete,
