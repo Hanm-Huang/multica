@@ -136,7 +136,22 @@
     "mode_badge_worktree_tooltip": "Les exécutions ont lieu simultanément dans leur propre worktree git et restituent une branche. Votre copie de travail reste intacte.",
     "toast_local_mode_updated": "Mode d'exécution mis à jour",
     "toast_local_mode_update_failed": "Impossible de mettre à jour le mode d'exécution",
-    "mode_badge_in_place": "Direct"
+    "mode_badge_in_place": "Direct",
+    "ref_label": "Branche, tag ou commit",
+    "ref_placeholder": "main",
+    "ref_hint": "Laissez vide pour démarrer depuis la branche par défaut du dépôt.",
+    "ref_error_too_long": "255 caractères maximum.",
+    "ref_error_characters": "Une réf git ne peut pas contenir d'espace ni les caractères ~ ^ : ? * [ \\",
+    "ref_error_format": "Branche, tag ou commit invalide.",
+    "ref_dialog_title": "Où les tâches doivent-elles démarrer ?",
+    "ref_dialog_description": "Les tâches de ce projet récupèrent cette réf par défaut. Cela ne change pas où leur travail aboutit, et une tâche qui précise sa propre réf garde la priorité.",
+    "ref_cancel": "Annuler",
+    "ref_save": "Enregistrer",
+    "ref_edit_tooltip": "Changer le point de départ des tâches",
+    "ref_badge_tooltip": "Les tâches démarrent depuis {{ref}} au lieu de la branche par défaut.",
+    "toast_ref_updated": "Point de départ mis à jour",
+    "toast_ref_cleared": "Retour à la branche par défaut",
+    "toast_ref_update_failed": "Impossible de mettre à jour le point de départ"
   },
   "delete_dialog": {
     "title": "Supprimer le projet",

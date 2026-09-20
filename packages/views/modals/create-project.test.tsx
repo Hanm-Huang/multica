@@ -16,8 +16,10 @@ vi.mock("@tanstack/react-query", () => ({
   queryOptions: (options: unknown) => options,
 }));
 
+const createProjectMock = vi.hoisted(() => vi.fn().mockResolvedValue({ id: "p1" }));
+
 vi.mock("@multica/core/projects/mutations", () => ({
-  useCreateProject: () => ({ mutateAsync: vi.fn() }),
+  useCreateProject: () => ({ mutateAsync: createProjectMock }),
 }));
 
 vi.mock("@multica/core/projects", () => ({
@@ -67,9 +69,19 @@ vi.mock("../navigation", () => ({
 }));
 
 vi.mock("../editor", () => {
-  const ContentEditor = React.forwardRef<HTMLTextAreaElement, { placeholder?: string }>(
-    ({ placeholder }, ref) => <textarea ref={ref} placeholder={placeholder} />,
-  );
+  // Exposes the imperative handle the modal actually calls on submit
+  // (getMarkdown). A plain textarea ref makes every submit throw, which is
+  // invisible until a test clicks Create Project.
+  const ContentEditor = React.forwardRef<
+    { getMarkdown: () => string },
+    { placeholder?: string }
+  >(({ placeholder }, ref) => {
+    const inner = React.useRef<HTMLTextAreaElement>(null);
+    React.useImperativeHandle(ref, () => ({
+      getMarkdown: () => inner.current?.value ?? "",
+    }));
+    return <textarea ref={inner} placeholder={placeholder} />;
+  });
   ContentEditor.displayName = "ContentEditor";
 
   return {
@@ -199,6 +211,57 @@ describe("CreateProjectModal", () => {
 
     await user.click(screen.getByRole("button", { name: /Set due date/ }));
     expect(screen.getByRole("button", { name: "Due date" })).toBeInTheDocument();
+  });
+
+  // A project that tracks one delivery line has to be able to say so while it
+  // is being created — otherwise its very first tasks start from the default
+  // branch and the setting is something to discover afterwards.
+  it("attaches a repository with the checkout ref typed beside it", async () => {
+    createProjectMock.mockClear();
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await user.type(screen.getByPlaceholderText(/project title/i), "Release 2026-09");
+    await user.type(
+      screen.getByPlaceholderText(/github\.com\/owner\/repo/i),
+      apiRepoUrl,
+    );
+    await user.type(
+      screen.getByLabelText(/branch, tag, or commit/i),
+      "release/2026-09",
+    );
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
+    await user.click(screen.getByRole("button", { name: /^create project$/i }));
+
+    expect(createProjectMock).toHaveBeenCalledTimes(1);
+    const payload = createProjectMock.mock.calls[0]?.[0] as {
+      resources?: Array<{ resource_type: string; resource_ref: Record<string, unknown> }>;
+    };
+    expect(payload.resources).toEqual([
+      {
+        resource_type: "github_repo",
+        resource_ref: { url: apiRepoUrl, ref: "release/2026-09" },
+      },
+    ]);
+  });
+
+  it("omits the ref key for a repository left on its default branch", async () => {
+    createProjectMock.mockClear();
+    const user = userEvent.setup();
+    renderWithI18n(<CreateProjectModal onClose={vi.fn()} />);
+
+    await user.type(screen.getByPlaceholderText(/project title/i), "Plain project");
+    await user.type(
+      screen.getByPlaceholderText(/github\.com\/owner\/repo/i),
+      apiRepoUrl,
+    );
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
+    await user.click(screen.getByRole("button", { name: /^create project$/i }));
+
+    const payload = createProjectMock.mock.calls[0]?.[0] as {
+      resources?: Array<{ resource_ref: Record<string, unknown> }>;
+    };
+    expect(payload.resources?.[0]?.resource_ref).toEqual({ url: apiRepoUrl });
   });
 
   it("filters workspace repositories by search text", async () => {

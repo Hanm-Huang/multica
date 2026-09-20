@@ -135,7 +135,22 @@
     "mode_badge_worktree_tooltip": "実行はそれぞれの git ワークツリーで並行して進み、ブランチとして成果を返します。作業コピーは変更されません。",
     "toast_local_mode_updated": "実行モードを更新しました",
     "toast_local_mode_update_failed": "実行モードを更新できませんでした",
-    "mode_badge_in_place": "直接"
+    "mode_badge_in_place": "直接",
+    "ref_label": "ブランチ、タグ、またはコミット",
+    "ref_placeholder": "main",
+    "ref_hint": "空欄の場合はリポジトリのデフォルトブランチから開始します。",
+    "ref_error_too_long": "255 文字以内で入力してください。",
+    "ref_error_characters": "git ref にスペースや ~ ^ : ? * [ \\ は使用できません",
+    "ref_error_format": "有効なブランチ、タグ、コミットではありません。",
+    "ref_dialog_title": "タスクはどこから開始しますか？",
+    "ref_dialog_description": "このプロジェクトのタスクは既定でこの ref をチェックアウトします。作業の反映先は変わらず、タスクが自分で指定した ref が優先されます。",
+    "ref_cancel": "キャンセル",
+    "ref_save": "保存",
+    "ref_edit_tooltip": "タスクの開始位置を変更",
+    "ref_badge_tooltip": "タスクはデフォルトブランチではなく {{ref}} から開始します。",
+    "toast_ref_updated": "開始位置を更新しました",
+    "toast_ref_cleared": "デフォルトブランチに戻しました",
+    "toast_ref_update_failed": "開始位置を更新できませんでした"
   },
   "delete_dialog": {
     "title": "プロジェクトを削除",

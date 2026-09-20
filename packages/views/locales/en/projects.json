@@ -136,7 +136,22 @@
     "mode_badge_worktree_tooltip": "Runs execute at the same time in their own git worktree and hand back a branch. Your working copy is untouched.",
     "toast_local_mode_updated": "Execution mode updated",
     "toast_local_mode_update_failed": "Could not update the execution mode",
-    "mode_badge_in_place": "Direct"
+    "mode_badge_in_place": "Direct",
+    "ref_label": "Branch, tag, or commit",
+    "ref_placeholder": "main",
+    "ref_hint": "Leave empty to start from the repository's default branch.",
+    "ref_error_too_long": "Use at most 255 characters.",
+    "ref_error_characters": "A git ref can't contain spaces or any of ~ ^ : ? * [ \\",
+    "ref_error_format": "Not a valid branch, tag, or commit.",
+    "ref_dialog_title": "Where should tasks start?",
+    "ref_dialog_description": "Tasks in this project check out this ref by default. It doesn't change where their work lands, and a task that passes its own ref still wins.",
+    "ref_cancel": "Cancel",
+    "ref_save": "Save",
+    "ref_edit_tooltip": "Change where tasks start",
+    "ref_badge_tooltip": "Tasks start from {{ref}} instead of the default branch.",
+    "toast_ref_updated": "Starting point updated",
+    "toast_ref_cleared": "Back to the default branch",
+    "toast_ref_update_failed": "Could not update the starting point"
   },
   "delete_dialog": {
     "title": "Delete project",
