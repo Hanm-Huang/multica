@@ -713,6 +713,9 @@ deleted_workflow_versions AS (
 ),
 deleted_workflows AS (
     DELETE FROM workflow WHERE workspace_id = $1
+),
+deleted_workflow_releases AS (
+    DELETE FROM workflow_release WHERE workspace_id = $1
 )
 DELETE FROM project WHERE project.workspace_id = $1;
 
@@ -760,12 +763,14 @@ WHERE workspace_id = $1;
 SELECT object_key
 FROM (
     SELECT source_object_key AS object_key
-    FROM knowledge_document_version
-    WHERE workspace_id = $1 AND source_object_key <> ''
+    FROM knowledge_document_version AS document_version
+    WHERE document_version.workspace_id = $1 AND document_version.source_object_key <> ''
     UNION
     SELECT parsed_object_key AS object_key
-    FROM knowledge_document_version
-    WHERE workspace_id = $1 AND parsed_object_key IS NOT NULL AND parsed_object_key <> ''
+    FROM knowledge_document_version AS document_version
+    WHERE document_version.workspace_id = $1
+      AND document_version.parsed_object_key IS NOT NULL
+      AND document_version.parsed_object_key <> ''
 ) AS keys
 ORDER BY object_key;
 
@@ -773,7 +778,7 @@ ORDER BY object_key;
 INSERT INTO knowledge_job (
     id, workspace_id, knowledge_base_id, stage, logical_key, input, status, available_at
 )
-VALUES ($1, $2, $3, 'cleanup', $4, $5::jsonb, 'queued', now());
+VALUES ($1, $2, $3, 'cleanup', $4, sqlc.arg(input)::jsonb, 'queued', now());
 
 -- Workspace deletion is application-owned for the independent knowledge
 -- domain too. The synthetic base id belongs only to the cleanup job and lets
@@ -833,5 +838,5 @@ deleted_requests AS (
 deleted_bases AS (
     DELETE FROM knowledge_base WHERE workspace_id = $1 RETURNING 1
 )
-DELETE FROM knowledge_job
-WHERE workspace_id = $1 AND id <> $2;
+DELETE FROM knowledge_job AS job
+WHERE job.workspace_id = $1 AND job.id <> $2;

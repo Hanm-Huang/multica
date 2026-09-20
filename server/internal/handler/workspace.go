@@ -1203,7 +1203,10 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		{
 			name: "delete knowledge data",
 			run: func() error {
-				return qtx.DeleteWorkspaceKnowledgeData(ctx, requester.WorkspaceID, pgtype.UUID{Bytes: knowledgeCleanupJobID, Valid: true})
+				return qtx.DeleteWorkspaceKnowledgeData(ctx, db.DeleteWorkspaceKnowledgeDataParams{
+					WorkspaceID: requester.WorkspaceID,
+					ID:          pgtype.UUID{Bytes: knowledgeCleanupJobID, Valid: true},
+				})
 			},
 		},
 		{

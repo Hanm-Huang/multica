@@ -252,6 +252,78 @@ func (q *Queries) DeleteWorkspaceIssueRoots(ctx context.Context, workspaceID pgt
 	return err
 }
 
+const deleteWorkspaceKnowledgeData = `-- name: DeleteWorkspaceKnowledgeData :exec
+WITH
+deleted_evidence AS (
+    DELETE FROM knowledge_evidence WHERE workspace_id = $1 RETURNING 1
+),
+deleted_relations AS (
+    DELETE FROM knowledge_relation WHERE workspace_id = $1 RETURNING 1
+),
+deleted_aliases AS (
+    DELETE FROM knowledge_entity_alias WHERE workspace_id = $1 RETURNING 1
+),
+deleted_entities AS (
+    DELETE FROM knowledge_entity WHERE workspace_id = $1 RETURNING 1
+),
+deleted_extractions AS (
+    DELETE FROM knowledge_extraction_run WHERE workspace_id = $1 RETURNING 1
+),
+deleted_embeddings AS (
+    DELETE FROM knowledge_embedding WHERE workspace_id = $1 RETURNING 1
+),
+deleted_chunks AS (
+    DELETE FROM knowledge_chunk WHERE workspace_id = $1 RETURNING 1
+),
+deleted_versions AS (
+    DELETE FROM knowledge_document_version WHERE workspace_id = $1 RETURNING 1
+),
+deleted_documents AS (
+    DELETE FROM knowledge_document WHERE workspace_id = $1 RETURNING 1
+),
+deleted_indexes AS (
+    DELETE FROM knowledge_index WHERE workspace_id = $1 RETURNING 1
+),
+deleted_bindings AS (
+    DELETE FROM knowledge_model_binding WHERE workspace_id = $1 RETURNING 1
+),
+deleted_graph_edits AS (
+    DELETE FROM knowledge_graph_edit WHERE workspace_id = $1 RETURNING 1
+),
+deleted_capabilities AS (
+    DELETE FROM knowledge_model_capability WHERE workspace_id = $1 RETURNING 1
+),
+deleted_settings AS (
+    DELETE FROM knowledge_model_settings WHERE workspace_id = $1 RETURNING 1
+),
+deleted_providers AS (
+    DELETE FROM knowledge_provider WHERE workspace_id = $1 RETURNING 1
+),
+deleted_requests AS (
+    DELETE FROM knowledge_request WHERE workspace_id = $1 RETURNING 1
+),
+deleted_bases AS (
+    DELETE FROM knowledge_base WHERE workspace_id = $1 RETURNING 1
+)
+DELETE FROM knowledge_job AS job
+WHERE job.workspace_id = $1 AND job.id <> $2
+`
+
+type DeleteWorkspaceKnowledgeDataParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ID          pgtype.UUID `json:"id"`
+}
+
+// Workspace deletion is application-owned for the independent knowledge
+// domain too. The synthetic base id belongs only to the cleanup job and lets
+// the job retain the existing non-null knowledge_base_id contract after the
+// real bases are removed. Every table is listed explicitly because this
+// schema deliberately has no foreign keys or cascading actions.
+func (q *Queries) DeleteWorkspaceKnowledgeData(ctx context.Context, arg DeleteWorkspaceKnowledgeDataParams) error {
+	_, err := q.db.Exec(ctx, deleteWorkspaceKnowledgeData, arg.WorkspaceID, arg.ID)
+	return err
+}
+
 const deleteWorkspaceLeafData = `-- name: DeleteWorkspaceLeafData :exec
 WITH
 ws_agents AS MATERIALIZED (
@@ -633,6 +705,9 @@ deleted_workflow_versions AS (
 ),
 deleted_workflows AS (
     DELETE FROM workflow WHERE workspace_id = $1
+),
+deleted_workflow_releases AS (
+    DELETE FROM workflow_release WHERE workspace_id = $1
 )
 DELETE FROM project WHERE project.workspace_id = $1
 `
@@ -651,6 +726,16 @@ DELETE FROM skill WHERE skill.workspace_id = $1
 
 func (q *Queries) DeleteWorkspaceSquadsAndSkills(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteWorkspaceSquadsAndSkills, workspaceID)
+	return err
+}
+
+const deleteWorkspaceWorkflowCommands = `-- name: DeleteWorkspaceWorkflowCommands :exec
+DELETE FROM workflow_command
+WHERE workspace_id = $1
+`
+
+func (q *Queries) DeleteWorkspaceWorkflowCommands(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteWorkspaceWorkflowCommands, workspaceID)
 	return err
 }
 
@@ -676,6 +761,32 @@ WHERE parent_task_id = ANY($1::uuid[])
 // inside one statement is not well defined.
 func (q *Queries) DetachTaskBatchReferences(ctx context.Context, taskIds []pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, detachTaskBatchReferences, taskIds)
+	return err
+}
+
+const enqueueWorkspaceKnowledgeCleanup = `-- name: EnqueueWorkspaceKnowledgeCleanup :exec
+INSERT INTO knowledge_job (
+    id, workspace_id, knowledge_base_id, stage, logical_key, input, status, available_at
+)
+VALUES ($1, $2, $3, 'cleanup', $4, $5::jsonb, 'queued', now())
+`
+
+type EnqueueWorkspaceKnowledgeCleanupParams struct {
+	ID              pgtype.UUID `json:"id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	KnowledgeBaseID pgtype.UUID `json:"knowledge_base_id"`
+	LogicalKey      string      `json:"logical_key"`
+	Input           []byte      `json:"input"`
+}
+
+func (q *Queries) EnqueueWorkspaceKnowledgeCleanup(ctx context.Context, arg EnqueueWorkspaceKnowledgeCleanupParams) error {
+	_, err := q.db.Exec(ctx, enqueueWorkspaceKnowledgeCleanup,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.KnowledgeBaseID,
+		arg.LogicalKey,
+		arg.Input,
+	)
 	return err
 }
 
@@ -1061,6 +1172,46 @@ func (q *Queries) ListWorkspaceIssueIDPage(ctx context.Context, arg ListWorkspac
 	return items, nil
 }
 
+const listWorkspaceKnowledgeObjectKeys = `-- name: ListWorkspaceKnowledgeObjectKeys :many
+SELECT object_key
+FROM (
+    SELECT source_object_key AS object_key
+    FROM knowledge_document_version AS document_version
+    WHERE document_version.workspace_id = $1 AND document_version.source_object_key <> ''
+    UNION
+    SELECT parsed_object_key AS object_key
+    FROM knowledge_document_version AS document_version
+    WHERE document_version.workspace_id = $1
+      AND document_version.parsed_object_key IS NOT NULL
+      AND document_version.parsed_object_key <> ''
+) AS keys
+ORDER BY object_key
+`
+
+// Knowledge owns private source and parsed objects outside the relational
+// database. Keep the cleanup job itself after the workspace row is deleted so
+// a worker can finish the object-store deletion without needing the workspace
+// or base row to exist.
+func (q *Queries) ListWorkspaceKnowledgeObjectKeys(ctx context.Context, workspaceID pgtype.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceKnowledgeObjectKeys, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var object_key string
+		if err := rows.Scan(&object_key); err != nil {
+			return nil, err
+		}
+		items = append(items, object_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkspaceRuntimeIDFirstPage = `-- name: ListWorkspaceRuntimeIDFirstPage :many
 SELECT id FROM agent_runtime
 WHERE agent_runtime.workspace_id = $1
@@ -1232,137 +1383,5 @@ SELECT set_config('multica.workspace_teardown', 'on', true)
 // dirty triggers skip their per-row work while this flag is on.
 func (q *Queries) SetWorkspaceTeardownMode(ctx context.Context) error {
 	_, err := q.db.Exec(ctx, setWorkspaceTeardownMode)
-	return err
-}
-
-const deleteWorkspaceWorkflowCommands = `-- name: DeleteWorkspaceWorkflowCommands :exec
-DELETE FROM workflow_command
-WHERE workspace_id = $1
-`
-
-func (q *Queries) DeleteWorkspaceWorkflowCommands(ctx context.Context, workspaceID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, deleteWorkspaceWorkflowCommands, workspaceID)
-	return err
-}
-
-const listWorkspaceKnowledgeObjectKeys = `-- name: ListWorkspaceKnowledgeObjectKeys :many
-SELECT object_key
-FROM (
-    SELECT source_object_key AS object_key
-    FROM knowledge_document_version
-    WHERE workspace_id = $1 AND source_object_key <> ''
-    UNION
-    SELECT parsed_object_key AS object_key
-    FROM knowledge_document_version
-    WHERE workspace_id = $1 AND parsed_object_key IS NOT NULL AND parsed_object_key <> ''
-) AS keys
-ORDER BY object_key
-`
-
-func (q *Queries) ListWorkspaceKnowledgeObjectKeys(ctx context.Context, workspaceID pgtype.UUID) ([]string, error) {
-	rows, err := q.db.Query(ctx, listWorkspaceKnowledgeObjectKeys, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []string{}
-	for rows.Next() {
-		var item string
-		if err := rows.Scan(&item); err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const enqueueWorkspaceKnowledgeCleanup = `-- name: EnqueueWorkspaceKnowledgeCleanup :exec
-INSERT INTO knowledge_job (
-    id, workspace_id, knowledge_base_id, stage, logical_key, input, status, available_at
-)
-VALUES ($1, $2, $3, 'cleanup', $4, $5::jsonb, 'queued', now())
-`
-
-type EnqueueWorkspaceKnowledgeCleanupParams struct {
-	ID              pgtype.UUID `json:"id"`
-	WorkspaceID     pgtype.UUID `json:"workspace_id"`
-	KnowledgeBaseID pgtype.UUID `json:"knowledge_base_id"`
-	LogicalKey      string      `json:"logical_key"`
-	Input           []byte      `json:"input"`
-}
-
-func (q *Queries) EnqueueWorkspaceKnowledgeCleanup(ctx context.Context, arg EnqueueWorkspaceKnowledgeCleanupParams) error {
-	_, err := q.db.Exec(ctx, enqueueWorkspaceKnowledgeCleanup,
-		arg.ID,
-		arg.WorkspaceID,
-		arg.KnowledgeBaseID,
-		arg.LogicalKey,
-		arg.Input,
-	)
-	return err
-}
-
-const deleteWorkspaceKnowledgeData = `-- name: DeleteWorkspaceKnowledgeData :exec
-WITH
-deleted_evidence AS (
-    DELETE FROM knowledge_evidence WHERE workspace_id = $1 RETURNING 1
-),
-deleted_relations AS (
-    DELETE FROM knowledge_relation WHERE workspace_id = $1 RETURNING 1
-),
-deleted_aliases AS (
-    DELETE FROM knowledge_entity_alias WHERE workspace_id = $1 RETURNING 1
-),
-deleted_entities AS (
-    DELETE FROM knowledge_entity WHERE workspace_id = $1 RETURNING 1
-),
-deleted_extractions AS (
-    DELETE FROM knowledge_extraction_run WHERE workspace_id = $1 RETURNING 1
-),
-deleted_embeddings AS (
-    DELETE FROM knowledge_embedding WHERE workspace_id = $1 RETURNING 1
-),
-deleted_chunks AS (
-    DELETE FROM knowledge_chunk WHERE workspace_id = $1 RETURNING 1
-),
-deleted_versions AS (
-    DELETE FROM knowledge_document_version WHERE workspace_id = $1 RETURNING 1
-),
-deleted_documents AS (
-    DELETE FROM knowledge_document WHERE workspace_id = $1 RETURNING 1
-),
-deleted_indexes AS (
-    DELETE FROM knowledge_index WHERE workspace_id = $1 RETURNING 1
-),
-deleted_bindings AS (
-    DELETE FROM knowledge_model_binding WHERE workspace_id = $1 RETURNING 1
-),
-deleted_graph_edits AS (
-    DELETE FROM knowledge_graph_edit WHERE workspace_id = $1 RETURNING 1
-),
-deleted_capabilities AS (
-    DELETE FROM knowledge_model_capability WHERE workspace_id = $1 RETURNING 1
-),
-deleted_settings AS (
-    DELETE FROM knowledge_model_settings WHERE workspace_id = $1 RETURNING 1
-),
-deleted_providers AS (
-    DELETE FROM knowledge_provider WHERE workspace_id = $1 RETURNING 1
-),
-deleted_requests AS (
-    DELETE FROM knowledge_request WHERE workspace_id = $1 RETURNING 1
-),
-deleted_bases AS (
-    DELETE FROM knowledge_base WHERE workspace_id = $1 RETURNING 1
-)
-DELETE FROM knowledge_job
-WHERE workspace_id = $1 AND id <> $2
-`
-
-func (q *Queries) DeleteWorkspaceKnowledgeData(ctx context.Context, workspaceID, cleanupJobID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, deleteWorkspaceKnowledgeData, workspaceID, cleanupJobID)
 	return err
 }

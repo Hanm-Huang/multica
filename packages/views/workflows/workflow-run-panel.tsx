@@ -60,7 +60,7 @@ export function WorkflowRunPanel({ wsId, workflowId, open, onOpenChange, selecte
 export function RunStatus({ status }: { status: string }) {
   const { t } = useT("workflows");
   const known = ["pending", "ready", "queued", "running", "waiting", "waiting_human", "retry_wait", "blocked", "succeeded", "failed", "cancelled", "skipped", "cancelling"];
-  return <span className="rounded bg-muted px-1.5 py-0.5 text-micro font-medium">{known.includes(status) ? t(($) => $.status[status as keyof typeof $.status]) : status}</span>;
+  return <span className="rounded-sm bg-muted px-1.5 py-0.5 text-micro font-medium">{known.includes(status) ? t(($) => $.status[status as keyof typeof $.status]) : status}</span>;
 }
 
 export function WorkflowRunDetail({ wsId, workflowId, run }: { wsId: string; workflowId: string; run: WorkflowRun }) {
@@ -98,7 +98,7 @@ function WorkflowNodeDetail({ wsId, workflowId, runId, nodeId }: { wsId: string;
   return <div className="space-y-3 rounded-lg bg-muted/40 p-3">
     {detail.data.definition.instructions && <p className="whitespace-pre-wrap break-words text-caption">{detail.data.definition.instructions}</p>}
     <div><h4 className="mb-2 text-caption font-semibold">{t(($) => $.attempts)}</h4><ol className="space-y-2">{detail.data.attempts.map((attempt, index) => <li key={`${attempt.activationId ?? "attempt"}-${index}`} className="flex flex-wrap items-center gap-2 text-micro"><RunStatus status={attempt.status} /><span>{t(($) => $.attempt, { count: attempt.attempt })}</span>{attempt.error && <span className="text-destructive">{attempt.error}</span>}</li>)}</ol></div>
-    {detail.data.outputs.length > 0 && <div><h4 className="mb-2 text-caption font-semibold">{t(($) => $.node_outputs)}</h4><div className="space-y-2">{detail.data.outputs.map((output) => <pre key={output.id} className="max-h-48 overflow-auto rounded border bg-background p-2 text-micro">{JSON.stringify(output.values, null, 2)}</pre>)}</div></div>}
+    {detail.data.outputs.length > 0 && <div><h4 className="mb-2 text-caption font-semibold">{t(($) => $.node_outputs)}</h4><div className="space-y-2">{detail.data.outputs.map((output) => <pre key={output.id} className="max-h-48 overflow-auto rounded-sm border bg-background p-2 text-micro">{JSON.stringify(output.values, null, 2)}</pre>)}</div></div>}
   </div>;
 }
 
