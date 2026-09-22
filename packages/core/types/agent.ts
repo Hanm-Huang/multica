@@ -298,6 +298,7 @@ export interface TaskCancellationActor {
 }
 
 export interface AgentTask {
+  wakeup_id?: string;
   id: string;
   agent_id: string;
   runtime_id: string;
@@ -314,6 +315,7 @@ export interface AgentTask {
     | "queued"
     | "dispatched"
     | "waiting_local_directory"
+    | "deferred"
     | "running"
     | "completed"
     | "failed"

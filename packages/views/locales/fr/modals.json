@@ -137,7 +137,8 @@
     "local_clear": "Effacer",
     "local_pick_failed": "Impossible d'ouvrir le sélecteur de répertoire.",
     "local_invalid_dir": "Ce répertoire ne peut pas être utilisé. Choisissez-en un autre.",
-    "local_hint": "Les agents des autres machines ne verront pas ce chemin — ils ne pourront pas démarrer. Utilisez des dépôts pour le travail partagé."
+    "local_hint": "Les agents des autres machines ne verront pas ce chemin — ils ne pourront pas démarrer. Utilisez des dépôts pour le travail partagé.",
+    "repos_ref_default": "Branche par défaut"
   },
   "create_issue": {
     "sr_manual": "Nouvelle tâche",
@@ -185,6 +186,7 @@
     "toast_link_subissues_partial": "Échec de la liaison de {{failed}} sous-tâches sur {{total}}",
     "toast_link_labels_failed": "Échec du rattachement des étiquettes",
     "toast_set_properties_failed": "Impossible de définir {{count}} valeurs de propriétés personnalisées",
+    "unavailable_property_removed": "Une propriété personnalisée qui n’est plus disponible a été retirée du brouillon. Vérifiez-le avant de le soumettre à nouveau.",
     "switch_to_agent": "Passer en mode agent",
     "switch_to_agent_tooltip": "Passer à la création avec un agent — décrivez en une ligne et laissez l'agent rédiger la tâche",
     "switch_to_manual": "Passer en mode manuel",

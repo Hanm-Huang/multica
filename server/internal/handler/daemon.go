@@ -2343,6 +2343,12 @@ func claimResponseAgentIdentityMatches(resp AgentTaskResponse) bool {
 func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, issueSnapshot []byte, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
+	if err := (&service.IssueWakeupService{Tasks: h.TaskService}).CheckClaim(r.Context(), *task); err != nil {
+		if !errors.Is(err, service.ErrWakeupForbidden) {
+			return resp, nil, nil, 0, 0, h.rejectClaimSourceLoad(r.Context(), task, err, "wakeup", resp.WakeupID)
+		}
+		return resp, nil, nil, 0, 0, h.failClaimedTaskBeforeLaunch(r.Context(), task, "Wakeup is disabled or its authorization is no longer available.", taskfailure.ReasonInvalidTaskIdentity, "wakeup_unavailable", http.StatusConflict, "wakeup unavailable")
+	}
 	var issueNumber int32
 	// Claim-only capability: this server resolves the squad-leader role on the
 	// wire (is_leader_task / squad_id), so the daemon must not re-derive it
@@ -4378,8 +4384,8 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 //
 // Scope + loop safety:
 //   - MEMBER comments keep their full routing. AGENT comments qualify through
-//     explicit mentions, or the worker-to-assigned-leader route when the input
-//     was already accepted and recorded in this run's plan. Timestamp-only
+//     explicit mentions, or a worker-to-leader route when the input was already
+//     accepted and recorded in this run's plan. Timestamp-only
 //     implicit agent replies are excluded: completion must not invent a new
 //     conversation. Current invocation permissions and self-trigger guards
 //     still apply to every replay.
@@ -4487,6 +4493,7 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		}
 		triggers, _ := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, actorType, actorID, commentTriggerComputeOptions{
 			ExcludeTriggerCommentID: c.ID,
+			AuthoringTaskID:         c.SourceTaskID,
 			OriginatorUserID:        originatorUserID,
 		})
 		// Agent replies discovered only by timestamp must not start a new
@@ -4554,7 +4561,7 @@ func keepReplayableAgentTriggers(triggers []commentAgentTrigger, planned bool) [
 		switch trigger.Source {
 		case commentTriggerSourceMentionAgent, commentTriggerSourceMentionSquadLeader:
 			filtered = append(filtered, trigger)
-		case commentTriggerSourceIssueAssignee:
+		case commentTriggerSourceIssueAssignee, commentTriggerSourceThreadParent:
 			if planned && trigger.NonLeaderAgentReply {
 				filtered = append(filtered, trigger)
 			}

@@ -1,3 +1,6 @@
+import type { IssueWakeup, IssueWakeupSummaryRow } from "../types/issue-wakeup";
+import type { WorkspaceWakeupPage, WorkspaceWakeupFilters } from "../types/issue-wakeup";
+import { WorkspaceWakeupPageSchema, IssueWakeupSchema, IssueWakeupSummaryRowSchema } from "./schemas";
 import type { InboxFilters } from "../inbox/filter-store";
 import type { ArchivedInboxPage, ArchivedInboxFacets } from "../types/inbox";
 import type { Workflow, WorkflowRun, WorkflowEvent, CreateWorkflowRequest, UpdateWorkflowRequest, StartWorkflowRunRequest, SendWorkflowChatMessageRequest, WorkflowCapabilities, WorkflowRelease, WorkflowValidationResult, WorkflowTemplate, StartWorkflowTestRunRequest, WorkflowWorkItem, SubmitWorkflowWorkItemRequest, WorkflowRunOwnerUpdateRequest, WorkflowNodeResolution, WorkflowRunNodeDetail, WorkflowUpgradeResult } from "../types/workflow";
@@ -617,6 +620,30 @@ function assertAgentConversationStartersWriteSupported(data: {
     throw new Error(
       "This server version does not support agent conversation starters. Update the server before saving them.",
     );
+  }
+}
+
+function requestedIssueCreateProperties(
+  data: CreateIssueRequest,
+): NonNullable<CreateIssueRequest["properties"]> | undefined {
+  const properties = data.properties;
+  return properties && Object.keys(properties).length > 0 ? properties : undefined;
+}
+
+function assertIssueCreatePropertiesSnapshot(
+  requested: NonNullable<CreateIssueRequest["properties"]> | undefined,
+  issue: Issue,
+): void {
+  if (!requested) return;
+  for (const propertyId of Object.keys(requested)) {
+    // The server may canonicalize a valid request (trim a URL, order and
+    // de-duplicate a multi-select, normalize an actor UUID). Presence is the
+    // integrity signal here; IssueSchema has already validated the value type.
+    if (!Object.prototype.hasOwnProperty.call(issue.properties, propertyId)) {
+      throw new Error(
+        `Issue ${issue.identifier || issue.id} was created, but the server did not confirm its custom properties. Review the issue before retrying.`,
+      );
+    }
   }
 }
 
@@ -1294,8 +1321,8 @@ export class ApiClient {
    * unique `(workspace_id, number)` index, and 404s on a wrong prefix or a
    * missing number.
    *
-   * `signal` is optional so cancel-on-unmount callers (identifier autolink
-   * resolution) can abort an in-flight lookup the same way search does.
+   * `signal` remains optional for callers that need to abort an in-flight
+   * lookup; identifier autolink resolution intentionally lets it complete.
    *
    * The 2xx body is validated, not cast. A single issue is not a list: there
    * is no safe-empty shape to degrade to, and the identifier-autolink caller
@@ -1305,6 +1332,40 @@ export class ApiClient {
    * an ApiError 404, so `issueIdentifierOptions` propagates it instead of
    * caching it as "no such issue".
    */
+  async listWorkspaceWakeups(filters: WorkspaceWakeupFilters): Promise<WorkspaceWakeupPage> {
+    const params = new URLSearchParams(Object.entries(filters).map(([key, value]) => [key, String(value)]));
+    const raw = await this.fetch<unknown>(`/api/issue-wakeups?${params}`);
+    const parsed = parseWithFallback<WorkspaceWakeupPage | null>(raw, WorkspaceWakeupPageSchema, null, { endpoint: "GET /api/issue-wakeups" });
+    if (!parsed) throw new Error("Could not load workspace wakeups");
+    return parsed;
+  }
+
+  async listIssueWakeups(issueId: string): Promise<IssueWakeup[]> {
+    const raw = await this.fetch<unknown>(`/api/issues/${encodeURIComponent(issueId)}/wakeups`);
+    const parsed = parseWithFallback<IssueWakeup[] | null>(raw, IssueWakeupSchema.array(), null, { endpoint: "GET /api/issues/:id/wakeups" });
+    if (!parsed) throw new Error("Could not load wakeups");
+    return parsed;
+  }
+
+  async listIssueWakeupSummaries(): Promise<IssueWakeupSummaryRow[]> {
+    const raw = await this.fetch<unknown>("/api/issue-wakeup-summaries");
+    const parsed = parseWithFallback<IssueWakeupSummaryRow[] | null>(raw, IssueWakeupSummaryRowSchema.array(), null, { endpoint: "GET /api/issue-wakeup-summaries" });
+    if (!parsed) throw new Error("Could not load wakeup summaries");
+    return parsed;
+  }
+
+  async enableIssueWakeup(issueId: string, wakeupId: string, input: { revision: number; at?: string; rearm?: boolean }): Promise<void> {
+    await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/wakeups/${encodeURIComponent(wakeupId)}/enable`, { method: "POST", body: JSON.stringify(input) });
+  }
+
+  async editIssueWakeupInstruction(issueId: string, wakeupId: string, input: { instruction: string; expected_instruction: string; revision: number }): Promise<void> {
+    await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/wakeups/${encodeURIComponent(wakeupId)}/instruction`, { method: "PATCH", body: JSON.stringify(input) });
+  }
+
+  async disableIssueWakeup(issueId: string, wakeupId: string): Promise<void> {
+    await this.fetch(`/api/issues/${encodeURIComponent(issueId)}/wakeups/${encodeURIComponent(wakeupId)}/disable`, { method: "POST" });
+  }
+
   async getIssue(id: string, options?: { signal?: AbortSignal }): Promise<Issue> {
     const raw = await this.fetch<unknown>(
       `/api/issues/${encodeURIComponent(id)}`,
@@ -1321,6 +1382,15 @@ export class ApiClient {
   }
 
   async createIssue(data: CreateIssueRequest): Promise<Issue> {
+    const requestedProperties = requestedIssueCreateProperties(data);
+    if (requestedProperties) {
+      const config = await this.getConfig();
+      if (config.issue_create_properties_supported !== true) {
+        throw new Error(
+          "This server version does not support atomic custom properties on issue creation. Update the server before creating this issue.",
+        );
+      }
+    }
     // Parse through a schema (not a raw cast): the create modal keys its
     // label-attach compatibility fallback off `labels` being absent vs a
     // validated Label[], so an unvalidated wrong shape must not slip through.
@@ -1340,6 +1410,7 @@ export class ApiClient {
     if (!issue) {
       throw new Error();
     }
+    assertIssueCreatePropertiesSnapshot(requestedProperties, issue);
     return issue;
   }
 
@@ -1384,6 +1455,16 @@ export class ApiClient {
     data: CreateCommentSubIssueRequest,
   ): Promise<Issue | { task_id: string }> {
     try {
+      const requestedProperties =
+        data.mode === "manual" ? requestedIssueCreateProperties(data.issue) : undefined;
+      if (requestedProperties) {
+        const config = await this.getConfig();
+        if (config.issue_create_properties_supported !== true) {
+          throw new Error(
+            "This server version does not support atomic custom properties on issue creation. Update the server before creating this issue.",
+          );
+        }
+      }
       const raw = await this.fetch<unknown>(`/api/comments/${anchorCommentId}/sub-issues`, {
         method: "POST",
         body: JSON.stringify(data),
@@ -1393,6 +1474,7 @@ export class ApiClient {
           endpoint: "POST /api/comments/:id/sub-issues (manual)",
         });
         if (!issue) throw new Error("Invalid sub-issue response");
+        assertIssueCreatePropertiesSnapshot(requestedProperties, issue);
         return issue;
       }
       const task = parseWithFallback<{ task_id: string } | null>(

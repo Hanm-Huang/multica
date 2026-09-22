@@ -71,7 +71,7 @@ Mobile 本期不建设画布和人工办理界面；API 语义保持统一，手
 | 执行要求所有上游成功；无环校验；失败阻断下游，独立分支可继续 | [执行器](../../server/internal/workflow/run.go) | 改为路径激活和结构化区段，不能仅新增连线颜色 |
 | 手动重试只接受失败节点，保留任务，生成新运行并关联 retry lineage | [队列适配](../../server/internal/service/workflow_task.go) | 保留 lineage，增加自动策略、独立 activation 和返工代次 |
 | 调度每 3 秒扫描至多 200 个活跃工作流，依赖事件唤醒 | [执行器](../../server/internal/workflow/run.go) | 改用有序到期队列；避免长期阻塞运行占据全部扫描名额 |
-| 数据主要放 JSONB，已有节点 attempt 表及唯一索引 | [初始表](../../server/migrations/509_workflow.up.sql)、[attempt 索引](../../server/migrations/523_workflow_node_attempt.up.sql) | 可编辑图保留 JSON，运行控制字段和执行实例关系化 |
+| 数据主要放 JSONB，已有节点 attempt 表及唯一索引 | [初始表](../../server/migrations/536_workflow.up.sql)、[attempt 索引](../../server/migrations/550_workflow_node_attempt.up.sql) | 可编辑图保留 JSON，运行控制字段和执行实例关系化 |
 | 网络响应经 zod 解析；类型枚举目前封闭 | [Schema](../../packages/core/workflows/schemas.ts) | 图版本与能力协商先行，禁止旧客户端降级覆盖 |
 | 对话以 `workflow_edit` 修改草稿，不运行流程 | [内置工作流说明](../../server/internal/service/builtin_skills/multica-platform/references/workflows.md) | 扩展结构化提案与可见差异，不让模型直接控制运行状态 |
 

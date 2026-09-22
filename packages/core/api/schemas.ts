@@ -756,6 +756,9 @@ export interface AppConfigResponse {
   /** Whether agent create/update persists `conversation_starters`. Older servers
    * silently ignored the unknown field, so absent must be treated as false. */
   agent_conversation_starters_supported?: boolean;
+  /** Whether issue create atomically validates and persists `properties`.
+   * Older servers silently ignore the field, so absent means unsupported. */
+  issue_create_properties_supported?: boolean;
   /** Whether deleting a comment keeps its replies and the server routes
    * DELETE /api/comments/{id}/keep-replies. Older servers deleted the replies
    * too, so absent must be treated as false (#8296). */
@@ -1000,6 +1003,7 @@ export const AppConfigSchema = z.object({
   feature_flags: FeatureFlagsSchema,
   local_worktree_supported: BooleanWithDefaultSchema(false),
   agent_conversation_starters_supported: BooleanWithDefaultSchema(false),
+  issue_create_properties_supported: BooleanWithDefaultSchema(false),
   comment_delete_keep_replies_supported: BooleanWithDefaultSchema(false),
   knowledge_enabled: BooleanWithDefaultSchema(false),
   server_version: OptionalStringSchema,
@@ -1019,6 +1023,8 @@ export const EMPTY_APP_CONFIG: AppConfigResponse = {
   local_worktree_supported: false,
   // Fail closed: old servers returned success while dropping the field.
   agent_conversation_starters_supported: false,
+  // Fail closed: old servers returned success while dropping create properties.
+  issue_create_properties_supported: false,
   // Fail closed: old servers delete a comment's replies with it.
   comment_delete_keep_replies_supported: false,
   feature_flags: {},
@@ -1801,6 +1807,7 @@ const TaskUsageSchema = z.object({
 }).loose();
 
 export const AgentTaskSchema = z.object({
+  wakeup_id: z.string().optional().catch(undefined),
   cancelled_by_comment_change: z.boolean().optional().catch(undefined),
   cancelled_by: TaskCancellationActorSchema.optional().catch(undefined),
   id: z.string(),
@@ -3479,6 +3486,41 @@ export const EMPTY_JOIN_SHARE_LINK_RESPONSE: {
   workspace_id: "",
   workspace_slug: "",
 };
+
+export const IssueWakeupSchema = z.object({
+  id: z.string(), issue_id: z.string(), agent_id: z.string(), agent_name: z.string().default(""),
+  instruction: z.string(), kind: z.enum(["event", "at", "every", "cron"]), mode: z.enum(["once", "continuous"]),
+  event_types: z.array(z.string()), filter_agent_id: z.string().nullable(), filter_task_id: z.string().nullable(),
+  interval_seconds: z.number().nullable(), cron_expression: z.string().nullable(), timezone: z.string(),
+  next_fire_at: z.string().nullable(), enabled: z.boolean(), disabled_at: z.string().nullable(),
+  last_task_id: z.string().nullable(), last_error: z.string().nullable(),
+  filter_actor_type: z.enum(["member", "agent"]).nullable().optional(),
+  filter_actor_id: z.string().nullable().optional(),
+  filter_actor_name: z.string().nullable().optional(),
+  revision: z.number().int().positive().optional(),
+  filter_agent_name: z.string().nullable().optional(), last_task_status: z.string().nullable().optional(),
+});
+
+export const IssueWakeupSummaryRowSchema = IssueWakeupSchema.pick({
+  id: true, issue_id: true, agent_id: true, agent_name: true, kind: true, mode: true,
+  event_types: true, filter_task_id: true, filter_agent_name: true, interval_seconds: true,
+  filter_actor_type: true, filter_actor_id: true, filter_actor_name: true,
+  cron_expression: true, timezone: true, next_fire_at: true,
+}).extend({ active_count: z.number().int().positive(), event_count: z.number().int().nonnegative() });
+
+export const WorkspaceWakeupPageSchema = z.object({
+  items: z.array(IssueWakeupSchema.omit({ instruction: true }).extend({
+    issue_title: z.string(), issue_identifier: z.string(), issue_closed: z.boolean(),
+    can_manage: z.boolean(), active_runs: z.number().int().nonnegative(),
+    task: AgentTaskSchema.nullable(),
+  })),
+  total: z.number().int().nonnegative(),
+  counts: z.object({
+    active: z.number().int().nonnegative(), all: z.number().int().nonnegative(),
+    disabled: z.number().int().nonnegative(), ended: z.number().int().nonnegative(),
+  }),
+  agents: z.array(z.object({ id: z.string(), name: z.string() })),
+});
 
 // Older servers omit runtime_type; the protocol remains their compatibility target.
 export const RuntimeProfileSchema = z
